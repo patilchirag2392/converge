@@ -69,9 +69,20 @@ async def main() -> int:
     survived = "Alice" if "Alice" in final["text"] else "Bob"
     destroyed = "Bob" if survived == "Alice" else "Alice"
     print()
-    print(f"=> {survived}'s edit won. {destroyed}'s edit is gone from every replica.")
-    print("   Three edits were applied; the document contains one of the last two.")
-    print("   Note it did *converge* — everyone agrees. It just lost data.")
+    print(f"=> {survived}'s edit won. {destroyed}'s edit is gone for good — it was")
+    print("   never stored anywhere. Three edits applied, two survive.")
+
+    if alice_sees == bob_sees == final["text"]:
+        print("   This run happened to leave all three in agreement, which is luck")
+        print("   of timing rather than a guarantee. Run it again.")
+    else:
+        print()
+        print("   And it's worse than lost data: the two clients don't agree with")
+        print("   each other OR the server. Each one ends at 'my own last edit,")
+        print("   unless a remote frame landed after it' — and that ordering differs")
+        print("   per client. Neither can even detect the problem, because the server")
+        print("   never tells a client which rev its own edit was assigned.")
+        print("   So Stage 0 fails to converge, not just to preserve intent.")
     return 0
 
 
