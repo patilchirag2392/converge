@@ -1,8 +1,8 @@
 # Converge
 
 A real-time collaborative text editor, built in stages to learn distributed-systems
-concepts from the inside out. The sync and conflict-resolution logic is hand-written —
-no Yjs, no Automerge.
+concepts from the inside out. The sequence CRDT that merges concurrent edits is
+hand-written — no Yjs, no Automerge.
 
 **Stack:** React + TypeScript (client) · FastAPI + Python (server) · WebSockets (transport)
 
@@ -12,17 +12,17 @@ Build plan and learning gates: [ROADMAP.md](./ROADMAP.md).
 
 ## Status
 
-**Stage 0 — foundation, deliberately broken.** A single-instance server holds each
-document in memory and resolves nothing: the newest write replaces the whole document.
-Two tabs on the same doc will destroy each other's edits. That is the point — Stage 1
-replaces this with a CRDT, and keeping the `stage-0` tag means the before/after is
-demonstrable.
+**Stage 1 — the CRDT.** Concurrent edits merge instead of clobbering each other.
+Every replica (both browser tabs *and* the server) converges independently, with no
+coordination and no agreement on message order.
 
-- [x] React/TS client with a shared textarea
-- [x] FastAPI WebSocket server, single instance, document in memory
-- [x] Last-write-wins: edits from any client overwrite the doc
-- [x] Two browser tabs on the same doc
-- [x] `.gitignore`, README, `stage-0` tag
+- [x] Own sequence CRDT so concurrent edits merge cleanly
+- [x] Each character has a unique, ordered ID
+- [x] Concurrent inserts resolve deterministically on every replica
+
+Stage 0 is preserved at the **`stage-0`** tag — the same app with last-write-wins,
+kept so the before/after is demonstrable. `git checkout stage-0` to watch edits get
+destroyed, then come back.
 
 ---
 
@@ -43,15 +43,16 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5173/?doc=demo>, then open the same URL in a second tab (there's
-a button for it). The `doc` query param is the room — change it for a separate document.
-
-Set `VITE_WS_URL` (see `client/.env.example`) if the server isn't on `localhost:8000`.
+Open <http://localhost:5173/?doc=demo>, then the same URL in a second tab (there's a
+button). Type in both at once — both sets of keystrokes survive, and your cursor
+stays where you left it.
 
 ```bash
-cd server && uv run pytest              # 19 tests
-cd server && uv run python scripts/race_demo.py   # reproduce the data loss in the terminal
-curl localhost:8000/api/doc/demo        # peek at server-side state
+cd server && uv run pytest                       # 54 tests
+cd client && npm test                            # 43 tests
+cd server && uv run python scripts/race_demo.py  # the Stage 0 race, now merging
+cd server && uv run python scripts/gen_vectors.py # regenerate shared vectors
+curl localhost:8000/api/doc/demo                 # the server's own replica, rendered
 ```
 
 ---
@@ -60,114 +61,205 @@ curl localhost:8000/api/doc/demo        # peek at server-side state
 
 ```
 ┌──────────── Tab A ────────────┐          ┌──────── FastAPI (1 process) ────────┐
-│ React + TS                    │          │                                     │
-│  <textarea>                   │  WS      │  Hub                                 │
-│  useDocSocket()  ────────────────────────►   docs:  {doc_id -> Document}        │
-│   • local state is authoritative         │            Document{text, rev}       │
-│     while you type            │  JSON    │   conns: {doc_id -> {client_id: ws}} │
-└───────────────────────────────┘◄─────────┤                                      │
-┌──────────── Tab B ────────────┐          │  apply_edit() = self.text = text     │
-│ same component, same doc_id   │◄────────►│              ^^^^^^^^^^^^^^^^^^^^    │
-└───────────────────────────────┘          │              the entire "algorithm"  │
-                                           └─────────────────────────────────────┘
+│ React + TS                    │   ops    │                                     │
+│  <textarea>                   │  ──────► │  Hub                                 │
+│  useDocSocket()               │   JSON   │   docs:  {doc_id -> Document}        │
+│  RGA replica  ◄───────────────┼──────────┤            Document{ RGA replica }   │
+│   crdt.ts                     │          │   conns: {doc_id -> {client_id: ws}} │
+└───────────────────────────────┘          │                                      │
+┌──────────── Tab B ────────────┐          │  merges the same ops into its own    │
+│ RGA replica  ◄────────────────┼─────────►│  replica, then relays them verbatim  │
+└───────────────────────────────┘          └─────────────────────────────────────┘
+        three replicas, each converging on its own
 ```
 
-Server state is two dicts in process memory (`server/app/hub.py`). No database, no
-locks — one uvicorn worker means one event loop and one copy of the state, so every
-edit is serialized for free. That free serialization is exactly the assumption two
-instances behind a load balancer will break in Stage 3.
+The same algorithm is implemented twice — `server/app/crdt.py` and
+`client/src/crdt.ts` — so the server is a real participant rather than a referee.
+It can answer "what does this document say" without asking anyone, which Stage 2's
+persistence needs, and it means convergence can be tested exhaustively in Python.
 
-One WebSocket per tab: `ws://localhost:8000/ws/{doc_id}?client_id=...`. The doc id
-forms the room; `client_id` is per-tab (sessionStorage) so the server can avoid echoing
-your own edit back at you.
+The cost is two implementations of one algorithm, which will drift unless something
+stops it. That something is `shared/crdt-vectors.json`: generated from the Python
+side, asserted by both test suites. If they disagree, both suites fail.
 
 ### Wire protocol
 
 | Direction | Message | Meaning |
 |---|---|---|
-| S→C on connect | `{type:"snapshot", doc_id, text, rev, clients, client_id}` | full current doc |
-| C→S per keystroke | `{type:"edit", text}` | "the doc is now this string" |
-| S→C broadcast | `{type:"edit", text, rev, author}` | to everyone in the room *except* the author |
+| S→C on connect | `{type:"snapshot", doc_id, ops, rev, clients, client_id}` | the op history, not the text |
+| C→S on edit | `{type:"ops", ops}` | operations this tab just performed |
+| S→C broadcast | `{type:"ops", ops, rev, author}` | relayed verbatim to everyone *except* the author |
 | S→C on join/leave | `{type:"presence", clients}` | room size |
-| S→C on bad frame | `{type:"error", detail}` | frame ignored, socket stays open |
+| S→C on bad frame | `{type:"error", detail}` | frame rejected whole, socket stays open |
 
-The unit of change is **the entire document**, not an operation. Nothing tells the
-server which revision the client was editing, so it cannot detect a concurrent edit
-even in principle — there is nothing to compare. `rev` is a monotonic counter for
-display only; wiring it into a conflict check would be conflict resolution.
+```jsonc
+{"kind": "insert", "id": ["a7f", 12], "parent": ["b31", 4], "value": "x"}
+{"kind": "delete", "id": ["a7f", 12]}
+```
+
+The unit of change is an operation **naming a character** — never a position, never
+the whole document. `rev` counts applied operations and is display-only: nothing
+needs an ordering, so nothing depends on it.
 
 ---
 
-## What breaks, and why (Stage 0 learn-gate)
+## How the CRDT works
 
-Type in both tabs at the same time. Three separate failures show up:
-
-**1. Lost updates.** Both tabs hold `"hi"`. Both append a character and send the whole
-document. The server applies them in arrival order, last one wins, and the loser's
-keystroke is gone from every replica — it was never stored anywhere. Verified by
-`test_concurrent_edits_lose_data`.
-
-**2. Replicas diverge — and stay diverged.** The subtler failure, and the more
-interesting one. Because the server never echoes an edit back to its author, each
-client ends at *"my own last keystroke, unless a remote frame arrived after it"* —
-and those orderings differ per client. Observed in a real browser:
+**Every character gets a permanent id**, `(client_id, counter)`. Unique for all
+time, never reused, never changed. This is the whole trick, and it exists because
+positions are unusable across replicas:
 
 ```
-tab A textarea : "BBBBBBBB"   rev 4
-tab B textarea : "AAAAAAAA"   rev 3
-server document: "BBBBBBBB"   rev 4
+both tabs show:  "cat"
+tab A: insert "X" at position 1   ->  "cXat"
+tab B: delete position 0          ->  "at"
+
+B applies A's op: insert at position 1 of "at"  ->  "aXt"   ✗ wrong
 ```
 
-Tab B sits at older text and an older rev than the server, indefinitely, until someone
-types again. A client can't fix this alone: it is never told the rev its own edit was
-assigned, so it has no way to tell whether an incoming rev is newer or older than what
-it's already showing. Watch the two `rev:` pills disagree — that's divergence on screen.
-Verified by `test_clients_can_diverge_permanently`.
+A meant *after the c*. By the time B applied it, position 1 meant something else.
+So an insert instead says **"place this character immediately after id `(a,1)`"**,
+which stays true no matter what happened nearby. Deletes name an id too.
 
-So the project's namesake guarantee fails here twice over: the replicas neither
-preserve intent *nor* converge.
+**Siblings are ordered by id, descending.** When two characters claim the same
+parent, every replica sorts them by `(counter, client_id)` and lands on the same
+answer alone — no locks, no coordination, no asking the server. That's the
+deterministic-ordering guarantee.
 
-**3. The caret teleports.** Applying a remote edit replaces `textarea.value` wholesale,
-which destroys the selection and snaps your cursor to the end mid-word. Measured in the
-browser: caret at offset 2 → offset 14 after one remote edit. A consequence of shipping
-whole documents rather than operations, and it disappears once edits are ops.
+Descending isn't cosmetic, it's required. In `"ab"`, inserting `"c"` after `"a"`
+leaves `"a"` with two children, `c` and `b`. Newest-first gives `"acb"`;
+oldest-first would give `"abc"` — the character in the wrong place.
 
-Also: bandwidth is O(document) per keystroke. Fine for a toy, absurd for a real doc.
+**Deletes are tombstones.** A character can't actually be removed, because an
+operation still in flight may say "insert after that one" and would have nothing to
+attach to. Deleted ids are kept in a set and skipped when rendering. Storing them
+as a *set of ids* also means a delete can arrive **before** its insert and still be
+correct, which makes deletes idempotent and order-independent with no buffering.
 
-Three things left out on purpose to keep the failure visible: no debounce on send
-(debouncing shrinks the race window and hides the bug), no queue or retry for keystrokes
-typed while disconnected (they're simply dropped), and no server-side echo suppression
-beyond skipping the author.
+**Inserts that arrive early are parked, not dropped.** If an insert names a parent
+we haven't seen, it waits in `_pending` until that parent lands, then links —
+possibly unblocking others in a chain. This is what lets a snapshot be sent in
+arbitrary order, and every new tab exercises the path.
+
+**Counters are Lamport-style**: on applying any operation, a replica raises its
+counter to at least what it just saw, so "newer" keeps meaning something across
+replicas.
+
+Together: `apply()` is **commutative**, **idempotent** and **causal-safe**, so a
+replica converges regardless of what order anything arrives in, or whether it ever
+sees its own operations at all.
+
+### The consequence worth noticing
+
+In Stage 0, the server excluding an edit's author from the broadcast is precisely
+what caused permanent divergence — every client saw a different message order with
+no way to reconcile. That exclusion is now completely harmless. Operations commute,
+so it no longer matters what order anyone applies them in, or that a tab never
+hears its own work back.
+
+The bug wasn't patched. **The category of bug stopped existing.**
+
+---
+
+## What Stage 1 fixes, measured
+
+Same scenario that destroyed data in Stage 0, verified against a live server and in
+two real browser tabs:
+
+| | Stage 0 | Stage 1 |
+|---|---|---|
+| concurrent edits at the same spot | one silently destroyed | both survive |
+| tab A / tab B / server agree | no — `BBBBBBBB` / `AAAAAAAA` / `BBBBBBBB` | yes — all `BBBAAAXYZhello world!!` |
+| caret during a remote append | jumped 2 → 14 (end of doc) | stays at 2 |
+| caret when the remote insert is *before* it | destroyed | shifts 2 → 5, correctly |
+| bandwidth per keystroke | whole document | one operation |
+| editing while disconnected | keystrokes lost | queued, merged on reconnect |
+
+**Cursors are anchored to character ids too.** Offsets are meaningless across a
+merge, so before applying remote operations the client notes the *identity* of the
+character to the left of the caret, then finds where that character ended up. If
+the same batch deleted it, it walks left to the nearest survivor. Same trick as the
+text, applied to the cursor.
+
+**Editing offline now works**, and it's a consequence rather than a feature: since
+operations commute and are idempotent, holding them in an outbox and sending them
+later merges exactly as well as sending them immediately. On reconnect the incoming
+snapshot is *merged* into the existing replica rather than replacing it.
+
+---
+
+## Known limitations
+
+Being able to state these is worth more than hiding them.
+
+- **Backward typing interleaves.** RGA's real wart, asserted in
+  `test_known_limitation_backward_typing_can_interleave` rather than papered over.
+  Typing a word forwards chains each character onto the last, so concurrent words
+  stay contiguous. But typing right-to-left anchors every character to the *same*
+  parent, and two replicas doing that concurrently interleave character by
+  character (`"abc"` + `"xyz"` → `"xaybzc"`). Still converges; just not what either
+  user meant. Fugue and Yjs's YATA add anchoring rules that fix it.
+- **Tombstones grow forever.** Deleted characters are never reclaimed. Real systems
+  garbage-collect them once every replica has acknowledged the deletion.
+- **Rendering is O(n).** Every keystroke walks the whole tree to produce the text
+  and the visible-id list. Fine for documents this size, wrong for a large one — a
+  real implementation keeps an incrementally maintained index.
+- **One contiguous change per event.** The textarea diff assumes a single edited
+  region, which is true for typing, backspace, paste and select-and-replace, but
+  would be wrong for multi-cursor editing.
+- **Astral characters split.** The diff works in UTF-16 code units, so an emoji
+  becomes two nodes. Text round-trips fine; deleting half of one would not.
+- **Selections collapse.** Restoring the caret after a merge collapses a selection
+  to a single point.
 
 ### What would break if…
 
-- **…you ran two server instances?** Each gets its own `Hub`, so clients on different
-  instances never see each other at all. Stage 3.
+- **…you ran two server instances?** Each has its own `Hub`, so clients on
+  different instances never exchange operations at all. Stage 3.
 - **…the process restarted?** Every document is gone. Stage 2.
-- **…a client's socket dies mid-broadcast?** `Hub.broadcast` catches the failed send
-  and evicts that connection, so one dead tab can't break the fan-out.
+- **…a client sent one malformed operation in a batch?** The whole frame is
+  rejected before any of it is applied (`Hub.apply_ops` parses everything first),
+  so you never get a half-merged batch.
+- **…operations arrived out of order, duplicated, or not at all?** Out of order and
+  duplicated are both fine by construction. *Never* is not: this relies on the
+  WebSocket delivering everything eventually. A dropped operation is a permanent
+  hole, which is why a real system numbers operations per client and lets a peer
+  ask for a range it's missing.
 - **…the handler task is cancelled instead of disconnected?** The `finally` block's
   presence broadcast is skipped — an `await` in a cancelled task doesn't complete.
-  State cleanup (`hub.leave`) is synchronous and still runs. This is also why
-  `test_presence_drops_when_a_client_disconnects` calls `close()` explicitly:
-  starlette's test client *cancels* the server task on context exit, where real uvicorn
-  delivers a `websocket.disconnect`.
-- **…one client is very slow?** `broadcast` gathers all sends concurrently, but still
-  awaits the slowest before handling the next edit. A real system needs per-client
-  outbound queues.
+  State cleanup (`hub.leave`) is synchronous and still runs.
+
+---
+
+## Stage 1 learn-gate
+
+The three questions to be able to answer without looking:
+
+1. **Why does last-write-wins fail?** See the Stage 0 section of the `stage-0` tag's
+   README — it loses data *and* diverges, for two separate reasons.
+2. **Why does every character need a unique id?** The `"cat"` example above.
+3. **How do two clients inserting at the same position end up in the same order?**
+   Both characters claim the same parent; every replica sorts siblings by id
+   descending, which is a total order, so all of them compute the same sequence
+   with no coordination.
 
 ---
 
 ## Layout
 
 ```
+shared/crdt-vectors.json   cases both test suites assert, pinning the two implementations
 server/
-  app/hub.py            in-memory documents + connection rooms (the LWW "algorithm")
-  app/main.py           FastAPI app, WebSocket endpoint, wire protocol
-  scripts/race_demo.py  reproduce the lost update from the CLI
-  tests/                19 tests, including the data loss as an executable claim
+  app/crdt.py              the CRDT: ids, insert-after, sibling order, tombstones, buffering
+  app/hub.py               documents (each a replica) + connection rooms
+  app/main.py              FastAPI app, WebSocket endpoint, wire protocol
+  scripts/race_demo.py     the Stage 0 race, now merging cleanly
+  scripts/gen_vectors.py   regenerates the shared vectors
+  tests/                   54 tests, incl. every permutation of a concurrent edit set
 client/
-  src/protocol.ts       message types, mirrors main.py
-  src/useDocSocket.ts   the socket, reconnect, and local-vs-remote state
-  src/App.tsx           editor, status pills, inbound-edit log
+  src/crdt.ts              mirror of crdt.py
+  src/diff.ts              <textarea> value -> operations
+  src/useDocSocket.ts      socket, caret anchoring, offline outbox
+  src/App.tsx              editor, status pills, merged-operation log
+  src/crdt.test.ts         43 tests, incl. the shared vectors
 ```
