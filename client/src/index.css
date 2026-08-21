@@ -90,6 +90,19 @@ body {
   border-color: color-mix(in oklab, var(--bad) 40%, var(--border));
 }
 
+.pill.queued {
+  color: var(--warn);
+  border-color: color-mix(in oklab, var(--warn) 40%, var(--border));
+}
+
+.ins {
+  color: var(--ok);
+}
+
+.del {
+  color: var(--bad);
+}
+
 .editor-wrap {
   display: flex;
   min-width: 0;

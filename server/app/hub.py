@@ -1,12 +1,12 @@
 """In-memory document store and connection registry.
 
-Stage 0 has no conflict resolution on purpose. ``apply_edit`` replaces the whole
-document with whatever the most recent writer sent, so two people typing at once
-will destroy each other's work. See ROADMAP.md — Stage 1 is where that gets fixed.
+Each document is a full CRDT replica (see crdt.py), not a string. The server is
+therefore a real participant that converges alongside the browsers rather than a
+referee deciding who wins -- there is nothing left to decide.
 
-Everything here lives in one process's memory. That is fine only because a single
-uvicorn worker means one event loop, one copy of the state, and therefore no
-locking: each message handler runs to completion before the next one starts.
+Everything here still lives in one process's memory. That is fine only because a
+single uvicorn worker means one event loop, one copy of the state, and therefore
+no locking. Stage 2 makes it durable; Stage 3 makes it work across instances.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from .crdt import RGA, Op, parse_op
 
 
 class Connection(Protocol):
@@ -28,10 +30,17 @@ class Connection(Protocol):
 @dataclass
 class Document:
     doc_id: str
-    text: str = ""
-    rev: int = 0
-    """Monotonic edit counter. Observability only — nothing checks it before
-    applying an edit, which is exactly why edits can be lost."""
+    crdt: RGA
+
+    @property
+    def text(self) -> str:
+        return self.crdt.text
+
+    @property
+    def rev(self) -> int:
+        """Operations applied. Display only -- unlike Stage 0's rev, nothing
+        about correctness depends on it, because nothing needs ordering."""
+        return self.crdt.applied
 
 
 @dataclass
@@ -40,22 +49,30 @@ class Hub:
     _rooms: dict[str, dict[str, Connection]] = field(default_factory=dict)
 
     def document(self, doc_id: str) -> Document:
-        """Return the doc, creating an empty one the first time it's opened."""
+        """Return the doc, creating an empty replica the first time it's opened."""
         doc = self._docs.get(doc_id)
         if doc is None:
-            doc = self._docs[doc_id] = Document(doc_id=doc_id)
+            doc = self._docs[doc_id] = Document(doc_id=doc_id, crdt=RGA(f"server:{doc_id}"))
         return doc
 
-    def apply_edit(self, doc_id: str, text: str) -> Document:
-        """Last write wins: the new text becomes the document.
+    def apply_ops(self, doc_id: str, raw_ops: Any) -> Document:
+        """Merge a batch of operations into the document's replica.
 
-        The caller never tells us which revision they were editing, so we cannot
-        detect a concurrent edit even in principle — there is nothing to compare.
-        Whatever the previous writer typed is simply gone.
+        Every operation is parsed before any is applied, so one malformed entry
+        rejects the whole frame instead of leaving a half-merged batch. Beyond
+        that there is no conflict handling and nothing to reject on the merge
+        itself: operations commute, so any batch from any client in any order is
+        simply absorbed.
         """
+        if not isinstance(raw_ops, list) or not raw_ops:
+            raise ValueError("ops must be a non-empty list")
+        if len(raw_ops) > 5_000:
+            raise ValueError("too many operations in one frame")
+
+        parsed: list[Op] = [parse_op(raw) for raw in raw_ops]
         doc = self.document(doc_id)
-        doc.text = text
-        doc.rev += 1
+        for op in parsed:
+            doc.crdt.apply_parsed(op)
         return doc
 
     def join(self, doc_id: str, client_id: str, conn: Connection) -> Document:
@@ -70,7 +87,7 @@ class Hub:
         if not room:
             # The Document deliberately outlives its last reader, so you can
             # close both tabs and reopen to find your text. It dies with the
-            # process though — Stage 2 is what makes it durable.
+            # process though -- Stage 2 is what makes it durable.
             del self._rooms[doc_id]
 
     def client_count(self, doc_id: str) -> int:
@@ -81,8 +98,12 @@ class Hub:
     ) -> None:
         """Fan a message out to every client in the room except ``exclude``.
 
-        The author is excluded because they already applied the edit locally;
-        echoing it back would stomp their caret for no reason.
+        The author is skipped because it already applied its own operations
+        locally. In Stage 0 that exclusion was the direct cause of permanent
+        divergence: every client saw a different message order and there was no
+        way to reconcile. It is now completely harmless -- operations commute, so
+        it doesn't matter what order anyone applies them in, or that a client
+        never sees its own. The bug wasn't patched; the category stopped existing.
         """
         room = self._rooms.get(doc_id, {})
         targets = [(cid, conn) for cid, conn in room.items() if cid != exclude]

@@ -1,6 +1,8 @@
-"""Unit tests for the Hub. These pin down the Stage 0 semantics, including the
-data loss — when Stage 1 lands, `test_last_write_wins_destroys_the_earlier_edit`
-is the test that should start failing.
+"""Unit tests for the Hub.
+
+`test_concurrent_edits_both_survive` is the Stage 0 tripwire: the same scenario
+used to be asserted as data loss (`test_last_write_wins_destroys_the_earlier_edit`)
+and now has to keep both edits.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from app.crdt import RGA
 from app.hub import Hub
 
 
@@ -34,31 +37,79 @@ def test_document_is_created_empty_on_first_open() -> None:
     assert doc.rev == 0
 
 
-def test_apply_edit_replaces_text_and_bumps_rev() -> None:
+def test_apply_ops_merges_into_the_server_replica() -> None:
     hub = Hub()
-    hub.apply_edit("demo", "hello")
-    doc = hub.apply_edit("demo", "hello world")
-    assert doc.text == "hello world"
-    assert doc.rev == 2
+    writer = RGA("writer")
+    doc = hub.apply_ops("demo", writer.local_insert(0, "hello"))
+    assert doc.text == "hello"
+    assert doc.rev == 5  # one operation per character
 
 
-def test_last_write_wins_destroys_the_earlier_edit() -> None:
-    """Two clients edit the same base text; only the second survives."""
+def test_concurrent_edits_both_survive() -> None:
+    """Two clients edit the same base concurrently; nothing is lost.
+
+    Stage 0's version of this test asserted that one edit was destroyed.
+    """
     hub = Hub()
-    hub.apply_edit("demo", "hi")
+    alice, bob = RGA("alice"), RGA("bob")
 
-    # Both clients read "hi", then type into their own copy.
-    hub.apply_edit("demo", "hi A")  # client A
-    doc = hub.apply_edit("demo", "hi B")  # client B, based on the same "hi"
+    base = alice.local_insert(0, "hi")
+    for op in base:
+        bob.apply(op)
+    hub.apply_ops("demo", base)
 
-    assert doc.text == "hi B"
-    assert "A" not in doc.text  # A's keystroke is gone from the only replica
+    # Neither client has seen the other's keystroke.
+    hub.apply_ops("demo", alice.local_insert(2, "A"))
+    doc = hub.apply_ops("demo", bob.local_insert(2, "B"))
+
+    assert "A" in doc.text and "B" in doc.text
+    assert doc.text == "hiBA"
+
+
+def test_server_replica_matches_the_clients() -> None:
+    hub = Hub()
+    alice, bob = RGA("alice"), RGA("bob")
+
+    base = alice.local_insert(0, "hi")
+    for op in base:
+        bob.apply(op)
+    hub.apply_ops("demo", base)
+
+    alice_ops = alice.local_insert(2, "A")
+    bob_ops = bob.local_insert(2, "B")
+    hub.apply_ops("demo", alice_ops)
+    hub.apply_ops("demo", bob_ops)
+
+    for op in bob_ops:
+        alice.apply(op)
+    for op in alice_ops:
+        bob.apply(op)
+
+    assert hub.document("demo").text == alice.text == bob.text
+
+
+def test_a_malformed_operation_rejects_the_whole_batch() -> None:
+    hub = Hub()
+    writer = RGA("writer")
+    good = writer.local_insert(0, "hi")
+
+    with pytest.raises(ValueError):
+        hub.apply_ops("demo", [*good, {"kind": "explode"}])
+
+    assert hub.document("demo").text == "", "nothing from the batch should land"
+
+
+@pytest.mark.parametrize("bad", [[], "not a list", {"kind": "insert"}, None])
+def test_apply_ops_rejects_a_bad_frame(bad: object) -> None:
+    hub = Hub()
+    with pytest.raises(ValueError):
+        hub.apply_ops("demo", bad)
 
 
 def test_document_survives_the_last_client_leaving() -> None:
     hub = Hub()
     hub.join("demo", "a", FakeConnection())
-    hub.apply_edit("demo", "persisted in memory")
+    hub.apply_ops("demo", RGA("writer").local_insert(0, "persisted in memory"))
     hub.leave("demo", "a")
 
     assert hub.client_count("demo") == 0
@@ -71,10 +122,10 @@ async def test_broadcast_skips_the_author() -> None:
     hub.join("demo", "author", author)
     hub.join("demo", "other", other)
 
-    await hub.broadcast("demo", {"type": "edit", "text": "x"}, exclude="author")
+    await hub.broadcast("demo", {"type": "ops", "ops": []}, exclude="author")
 
     assert author.sent == []
-    assert other.sent == [{"type": "edit", "text": "x"}]
+    assert other.sent == [{"type": "ops", "ops": []}]
 
 
 async def test_broadcast_does_not_leak_into_other_documents() -> None:
@@ -83,7 +134,7 @@ async def test_broadcast_does_not_leak_into_other_documents() -> None:
     hub.join("doc-1", "a", here)
     hub.join("doc-2", "b", elsewhere)
 
-    await hub.broadcast("doc-1", {"type": "edit", "text": "x"})
+    await hub.broadcast("doc-1", {"type": "ops", "ops": []})
 
     assert len(here.sent) == 1
     assert elsewhere.sent == []
@@ -97,13 +148,3 @@ async def test_broadcast_drops_a_dead_connection() -> None:
     await hub.broadcast("demo", {"type": "presence", "clients": 2})
 
     assert hub.client_count("demo") == 1
-
-
-@pytest.mark.parametrize("text", ["", "unicode: 日本語 🎉", "x" * 10_000])
-def test_apply_edit_accepts_any_string(text: str) -> None:
-    assert hub_text_after(text) == text
-
-
-def hub_text_after(text: str) -> str:
-    hub = Hub()
-    return hub.apply_edit("demo", text).text

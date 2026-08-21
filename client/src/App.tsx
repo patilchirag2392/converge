@@ -8,34 +8,39 @@ function readDocId(): string {
 const DOC_ID = readDocId();
 
 export default function App() {
-  const { text, rev, status, clients, clientId, events, setLocalText } = useDocSocket(DOC_ID);
+  const { text, rev, status, clients, clientId, events, queued, textareaRef, onChange } =
+    useDocSocket(DOC_ID);
 
   return (
     <div className="app">
       <header className="bar">
         <div className="brand">
           <strong>Converge</strong>
-          <span className="stage">Stage 0 · last-write-wins</span>
+          <span className="stage">Stage 1 · CRDT</span>
         </div>
         <div className="meta">
           <span className={`pill status-${status}`}>{status}</span>
           <span className="pill">doc: {DOC_ID}</span>
           <span className="pill">tab: {clientId}</span>
           <span className="pill">clients: {clients}</span>
-          <span className="pill">rev: {rev}</span>
+          <span className="pill">ops: {rev}</span>
+          {queued > 0 && <span className="pill queued">queued: {queued}</span>}
         </div>
       </header>
 
       <main className="editor-wrap">
         <textarea
+          ref={textareaRef}
           className="editor"
           value={text}
-          onChange={(event) => setLocalText(event.target.value)}
-          placeholder="Type here. Then open a second tab on the same URL and type in both at once."
+          onChange={onChange}
+          placeholder="Type here. Then open a second tab on the same URL and type in both at once — both sets of keystrokes survive."
           spellCheck={false}
         />
         <div className="under">
-          <span>{text.length} chars — the whole document is sent on every keystroke</span>
+          <span>
+            {text.length} chars — only the characters you changed go over the wire, as operations
+          </span>
           <button type="button" onClick={() => window.open(window.location.href, '_blank')}>
             Open a second tab
           </button>
@@ -43,10 +48,10 @@ export default function App() {
       </main>
 
       <aside className="log">
-        <h2>Inbound remote edits</h2>
+        <h2>Merged remote operations</h2>
         <p className="hint">
-          Each one <em>replaced</em> your entire document. If you were mid-word, that word is gone
-          and it is not recoverable — the server never stored it.
+          Each batch was <em>merged</em> into your document rather than replacing it. Nothing you
+          typed was lost, and your cursor stayed where you left it.
         </p>
         {events.length === 0 ? (
           <p className="empty">Nothing yet. Type in the other tab.</p>
@@ -54,9 +59,13 @@ export default function App() {
           <ol>
             {events.map((event) => (
               <li key={event.key}>
-                <code>rev {event.rev}</code> from <code>{event.author}</code>
+                <code>op {event.rev}</code> from <code>{event.author}</code>
                 <span className="at">{event.at}</span>
-                <div className="preview">{event.text.slice(0, 120) || '(empty)'}</div>
+                <div className="preview">
+                  {event.inserts > 0 && <span className="ins">+{event.inserts} inserted</span>}
+                  {event.inserts > 0 && event.deletes > 0 && ' · '}
+                  {event.deletes > 0 && <span className="del">−{event.deletes} deleted</span>}
+                </div>
               </li>
             ))}
           </ol>
