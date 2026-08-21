@@ -1,0 +1,27 @@
+[project]
+name = "converge-server"
+version = "0.1.0"
+description = "Converge Stage 0 — single-instance, in-memory, last-write-wins document server"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+# A blocked `receive_json` should fail the test, not hang the suite forever.
+timeout = 10
