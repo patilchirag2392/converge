@@ -102,6 +102,28 @@ export function useDocSocket(docId: string): DocSocket {
     setQueued(0);
   }, []);
 
+  /**
+   * Re-send everything this replica knows, after reconnecting.
+   *
+   * The hole this closes: if the server died after we applied an edit locally
+   * but before its database write committed, that operation exists only in this
+   * browser. The server's snapshot cannot contain it, and merging cannot invent
+   * it -- so reconnect has to be a *mutual* exchange. Both sides send what they
+   * have; both merge.
+   *
+   * Only sane because operations are idempotent and commutative: the server
+   * drops everything it already knows and relays only the genuine gaps, so this
+   * is cheap for everyone except the uploader. In Stage 0 the same move would
+   * have clobbered every other tab with a stale whole-document write.
+   */
+  const replayLocalState = useCallback(() => {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const message: ClientMessage = { type: 'ops', ops: crdt().snapshotOps() };
+    socket.send(JSON.stringify(message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const queue = useCallback(
     (ops: Operation[]) => {
       // Safe to sit on these: operations commute and are idempotent, so sending
@@ -177,14 +199,21 @@ export function useDocSocket(docId: string): DocSocket {
         }
 
         switch (message.type) {
-          case 'snapshot':
+          case 'snapshot': {
+            // Anything already here is state the server may not know about --
+            // this is a reconnect, not a first load.
+            const hadLocalState = crdt().applied > 0;
+
             // Merge rather than replace. On a reconnect this replica may already
             // hold edits the server has never seen, and re-applying operations
             // we already have is a no-op, so merging is always correct.
             merge(message.ops);
             setClients(message.clients);
             flush();
+
+            if (hadLocalState) replayLocalState();
             break;
+          }
 
           case 'ops':
             merge(message.ops);
@@ -231,7 +260,7 @@ export function useDocSocket(docId: string): DocSocket {
       socketRef.current = null;
       socket.close();
     };
-  }, [docId, clientId, merge, flush]);
+  }, [docId, clientId, merge, flush, replayLocalState]);
 
   const onChange = useCallback(
     (event: ChangeEvent<HTMLTextAreaElement>) => {

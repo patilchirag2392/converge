@@ -16,7 +16,7 @@ export default function App() {
       <header className="bar">
         <div className="brand">
           <strong>Converge</strong>
-          <span className="stage">Stage 1 · CRDT</span>
+          <span className="stage">Stage 2 · CRDT + Postgres</span>
         </div>
         <div className="meta">
           <span className={`pill status-${status}`}>{status}</span>
