@@ -162,26 +162,32 @@ class RGA:
 
     # ------------------------------------------- applying operations (any order)
 
-    def apply(self, raw: Any) -> None:
+    def apply(self, raw: Any) -> bool:
         """Apply one operation from anywhere -- remote, replayed, or duplicated.
 
         Raises ValueError on a malformed operation; never raises on a
         well-formed one, no matter what state we're in or what order it arrives.
         """
-        self.apply_parsed(parse_op(raw))
+        return self.apply_parsed(parse_op(raw))
 
-    def apply_parsed(self, op: Op) -> None:
+    def apply_parsed(self, op: Op) -> bool:
+        """Returns whether this operation told us anything new.
+
+        The server uses it to relay only genuinely-new operations, so a client
+        re-sending its whole snapshot on reconnect doesn't fan a redundant burst
+        out to every other tab. An insert that gets *parked* counts as new -- it
+        is information we didn't have, even though the text hasn't changed yet.
+        """
         if isinstance(op, Insert):
-            self._apply_insert(op.node)
-        else:
-            self._apply_delete(op.id)
+            return self._apply_insert(op.node)
+        return self._apply_delete(op.id)
 
     def _knows(self, node_id: Id) -> bool:
         return node_id == ROOT or node_id in self._nodes
 
-    def _apply_insert(self, node: Node) -> None:
+    def _apply_insert(self, node: Node) -> bool:
         if node.id in self._nodes:
-            return  # already applied; ops are idempotent
+            return False  # already applied; ops are idempotent
 
         # Lamport-style clock: never hand out an id whose counter is lower than
         # one we've already seen, so "newer" stays meaningful across replicas.
@@ -190,8 +196,10 @@ class RGA:
         if not self._knows(node.parent):
             # Causally not ready: we haven't seen the character this one attaches
             # to. Park it -- do NOT drop it -- and link it when the parent lands.
+            if any(node.id == waiting.id for waiting in self._pending.get(node.parent, ())):
+                return False
             self._pending.setdefault(node.parent, []).append(node)
-            return
+            return True
 
         # Linking a node can unblock others that arrived before it, and those can
         # unblock more. Worklist rather than recursion, for the same stack reason
@@ -204,6 +212,7 @@ class RGA:
             self._counter = max(self._counter, current.id[1])
             self._link(current)
             ready.extend(self._pending.pop(current.id, []))
+        return True
 
     def _link(self, node: Node) -> None:
         self._nodes[node.id] = node
@@ -212,7 +221,7 @@ class RGA:
         siblings.sort(key=order_key, reverse=True)
         self.applied += 1
 
-    def _apply_delete(self, node_id: Id) -> None:
+    def _apply_delete(self, node_id: Id) -> bool:
         """Tombstone: mark invisible, keep the id.
 
         The character can't actually be removed, because an operation still in
@@ -225,9 +234,10 @@ class RGA:
         and order-independent for free, with no buffering needed.
         """
         if node_id in self._deleted:
-            return
+            return False
         self._deleted.add(node_id)
         self.applied += 1
+        return True
 
     # -------------------------------------------------------------- local edits
 
