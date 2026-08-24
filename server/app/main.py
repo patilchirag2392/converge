@@ -29,6 +29,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from .bus import Bus, NullBus, RedisBus, redis_url
 from .db import apply_schema, create_pool
 from .hub import Hub
 from .store import OpStore, PostgresOpStore
@@ -46,7 +47,11 @@ def default_instance_id() -> str:
     return os.environ.get("INSTANCE_ID") or f"i-{uuid4().hex[:6]}"
 
 
-def create_app(store: OpStore | None = None, instance_id: str | None = None) -> FastAPI:
+def create_app(
+    store: OpStore | None = None,
+    instance_id: str | None = None,
+    bus: Bus | None = None,
+) -> FastAPI:
     """Build the app. Pass a store to use it; otherwise a real pool is opened.
 
     Injecting beats reading an env var to decide: tests build
@@ -60,16 +65,35 @@ def create_app(store: OpStore | None = None, instance_id: str | None = None) -> 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if store is not None:
-            app.state.hub = Hub(store=store)
+            app.state.hub = Hub(
+                store=store, bus=bus or NullBus(), instance_id=instance
+            )
             yield
             return
 
         pool = await create_pool()
         await apply_schema(pool)
-        app.state.hub = Hub(store=PostgresOpStore(pool))
+
+        # No REDIS_URL means single-instance mode: a NullBus, because there is
+        # nowhere for an operation to propagate to. The app is identical
+        # otherwise, which is what makes the Stage 3 before/after a config change
+        # rather than a different codebase.
+        url = redis_url()
+        live_bus: Bus
+        if url is None:
+            log.warning("REDIS_URL unset — no cross-instance propagation")
+            live_bus = NullBus()
+        else:
+            redis_bus = RedisBus(url)
+            await redis_bus.start()
+            live_bus = redis_bus
+            log.info("instance %s on bus %s", instance, url)
+
+        app.state.hub = Hub(store=PostgresOpStore(pool), bus=live_bus, instance_id=instance)
         try:
             yield
         finally:
+            await live_bus.close()
             await pool.close()
 
     app = FastAPI(title="Converge", version="0.4.0", lifespan=lifespan)
@@ -87,12 +111,31 @@ def create_app(store: OpStore | None = None, instance_id: str | None = None) -> 
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "instance": instance}
 
+    @app.get("/metrics")
+    async def metrics(request: Request) -> dict[str, object]:
+        """Cross-instance propagation delay, as observed by *this* instance.
+
+        Measured from the publisher's `published_at` to the moment this process
+        handled the message, so it covers Redis and both instances but not the
+        final hop to the browser. Wall-clock based: only meaningful when the
+        instances' clocks agree. scripts/latency_probe.py is the honest
+        end-to-end measurement.
+        """
+        hub: Hub = request.app.state.hub
+        return {
+            "instance": instance,
+            "documents_cached": hub.document_count,
+            "cross_instance_propagation": hub.latency.summary(),
+        }
+
     @app.get("/api/doc/{doc_id}")
     async def read_doc(doc_id: str, request: Request) -> dict[str, object]:
         """The server's own replica, rendered, loading it from Postgres if this
         process hasn't seen the document yet: ``curl localhost:8000/api/doc/demo``."""
         hub: Hub = request.app.state.hub
-        doc = await hub.document(doc_id)
+        # cache=False: reading must never leave behind a replica that no
+        # subscription is feeding. See Hub.document.
+        doc = await hub.document(doc_id, cache=False)
         return {
             "doc_id": doc.doc_id,
             "text": doc.text,
@@ -109,11 +152,9 @@ def create_app(store: OpStore | None = None, instance_id: str | None = None) -> 
         await websocket.accept()
         client_id = client_id or uuid4().hex[:8]
 
-        # Loading can hit the database, so it happens before the client is
-        # registered -- nobody should be broadcast to while their replica is
-        # still being rebuilt.
-        doc = await hub.document(doc_id)
-        hub.join(doc_id, client_id, websocket)
+        # attach() subscribes to this document's channel, *then* loads it, then
+        # registers the socket. The order closes the join race -- see Hub.attach.
+        doc = await hub.attach(doc_id, client_id, websocket)
         log.info("join doc=%s client=%s clients=%d", doc_id, client_id, hub.client_count(doc_id))
 
         # A new tab gets the operation history rather than the text, so it builds
@@ -150,7 +191,9 @@ def create_app(store: OpStore | None = None, instance_id: str | None = None) -> 
                     continue
 
                 try:
-                    doc, fresh = await hub.apply_ops(doc_id, message.get("ops"))
+                    doc, fresh = await hub.apply_ops(
+                        doc_id, message.get("ops"), author=client_id
+                    )
                 except ValueError as exc:
                     await websocket.send_json({"type": "error", "detail": str(exc)})
                     continue
@@ -163,22 +206,15 @@ def create_app(store: OpStore | None = None, instance_id: str | None = None) -> 
                     )
                     continue
 
-                if not fresh:
-                    # Everything in this frame was already known -- typically a
-                    # client replaying its snapshot after a reconnect.
-                    continue
-
-                # Relay verbatim. The server does not rewrite, reorder or renumber
-                # anything -- every replica merges the same operations itself.
-                await hub.broadcast(
-                    doc_id,
-                    {"type": "ops", "ops": fresh, "rev": doc.rev, "author": client_id},
-                    exclude=client_id,
-                )
+                # apply_ops owns the whole ordering -- persist, apply, fan out
+                # locally, then publish to the cluster -- so there is nothing to
+                # do here. `fresh` is empty when a frame was entirely known
+                # already, typically a client replaying its snapshot.
+                del fresh
         except WebSocketDisconnect:
             pass
         finally:
-            hub.leave(doc_id, client_id)
+            await hub.detach(doc_id, client_id)
             log.info(
                 "leave doc=%s client=%s clients=%d", doc_id, client_id, hub.client_count(doc_id)
             )

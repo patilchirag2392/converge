@@ -30,13 +30,18 @@ INSTANCE = "test-1"
 
 
 def fresh_client(
-    store: InMemoryOpStore | None = None, instance_id: str = INSTANCE
+    store: InMemoryOpStore | None = None,
+    instance_id: str = INSTANCE,
+    bus: object | None = None,
 ) -> TestClient:
     """An app with its own Hub and its own store. Pass a store to share one
-    across two apps, which is how a restart gets simulated."""
+    across two apps, which is how a restart gets simulated; pass a bus to wire
+    two apps together as two instances."""
     return TestClient(
         create_app(
-            store if store is not None else InMemoryOpStore(), instance_id=instance_id
+            store if store is not None else InMemoryOpStore(),
+            instance_id=instance_id,
+            bus=bus,  # type: ignore[arg-type]
         )
     )
 
