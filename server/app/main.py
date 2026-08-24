@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -35,7 +36,17 @@ from .store import OpStore, PostgresOpStore
 log = logging.getLogger("converge")
 
 
-def create_app(store: OpStore | None = None) -> FastAPI:
+def default_instance_id() -> str:
+    """Which process this is. Set INSTANCE_ID when running a cluster.
+
+    Reported by /healthz and in every snapshot frame, so you can see which
+    instance a browser tab actually landed on -- which is the whole point of
+    Stage 3, both for watching it break and for watching pub/sub fix it.
+    """
+    return os.environ.get("INSTANCE_ID") or f"i-{uuid4().hex[:6]}"
+
+
+def create_app(store: OpStore | None = None, instance_id: str | None = None) -> FastAPI:
     """Build the app. Pass a store to use it; otherwise a real pool is opened.
 
     Injecting beats reading an env var to decide: tests build
@@ -43,6 +54,8 @@ def create_app(store: OpStore | None = None) -> FastAPI:
     `app = create_app()` below and talks to Postgres. It also means there's no
     module-level Hub, so no state leaks between tests.
     """
+
+    instance = instance_id or default_instance_id()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -59,7 +72,7 @@ def create_app(store: OpStore | None = None) -> FastAPI:
         finally:
             await pool.close()
 
-    app = FastAPI(title="Converge", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="Converge", version="0.4.0", lifespan=lifespan)
 
     # Only needed for the plain HTTP debug routes; WebSocket handshakes are not
     # subject to CORS. The Vite dev server runs on 5173.
@@ -72,7 +85,7 @@ def create_app(store: OpStore | None = None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "instance": instance}
 
     @app.get("/api/doc/{doc_id}")
     async def read_doc(doc_id: str, request: Request) -> dict[str, object]:
@@ -85,6 +98,7 @@ def create_app(store: OpStore | None = None) -> FastAPI:
             "text": doc.text,
             "rev": doc.rev,
             "clients": hub.client_count(doc_id),
+            "instance": instance,
         }
 
     @app.websocket("/ws/{doc_id}")
@@ -113,6 +127,7 @@ def create_app(store: OpStore | None = None) -> FastAPI:
                 "rev": doc.rev,
                 "clients": hub.client_count(doc_id),
                 "client_id": client_id,
+                "instance": instance,
             }
         )
         await hub.broadcast(

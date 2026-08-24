@@ -26,10 +26,19 @@ from app.store import InMemoryOpStore
 from helpers import Tab
 
 
-def fresh_client(store: InMemoryOpStore | None = None) -> TestClient:
+INSTANCE = "test-1"
+
+
+def fresh_client(
+    store: InMemoryOpStore | None = None, instance_id: str = INSTANCE
+) -> TestClient:
     """An app with its own Hub and its own store. Pass a store to share one
     across two apps, which is how a restart gets simulated."""
-    return TestClient(create_app(store if store is not None else InMemoryOpStore()))
+    return TestClient(
+        create_app(
+            store if store is not None else InMemoryOpStore(), instance_id=instance_id
+        )
+    )
 
 
 def test_snapshot_is_sent_on_connect() -> None:
@@ -41,6 +50,7 @@ def test_snapshot_is_sent_on_connect() -> None:
             "rev": 0,
             "clients": 1,
             "client_id": "a",
+            "instance": INSTANCE,
         }
 
 
@@ -211,7 +221,7 @@ def test_malformed_frames_are_rejected_without_killing_the_socket() -> None:
 
 def test_healthz() -> None:
     with fresh_client() as client:
-        assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.get("/healthz").json() == {"status": "ok", "instance": INSTANCE}
 
 
 def test_a_document_outlives_the_app_that_created_it() -> None:

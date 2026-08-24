@@ -209,3 +209,90 @@ code-point aware, so an emoji becomes one node with both code units.
 Not fixed here (Stage 1 code, and unreachable by hand), but pinned by
 `test_a_batch_is_all_or_nothing`, which uses it as the poison value. Proper fix:
 snap `diffText`'s boundaries to code-point edges.
+
+---
+
+# Stage 3 — horizontal scaling with Redis pub/sub · build notes
+
+## Step 1: the break, reproduced before fixing anything
+
+Two instances (`a` on :8001, `b` on :8002) behind nginx on :8080, round-robin,
+both on the same Postgres. No Redis. `multi_instance_demo.py` output:
+
+```
+  alice -> instance 'b'
+  bob   -> instance 'a'
+
+alice typed "typed on one instance"
+  alice sees: 'typed on one instance'
+  bob sees:   ''
+=> DID NOT PROPAGATE within 3s.
+
+what each instance thinks the document says:
+  instance a (:8001): ''
+  instance b (:8002): 'typed on one instance'
+
+straight from Postgres:     'typed on one instance'
+```
+
+**Two distinct failures, one cause — state lives per process:**
+
+1. **The live broadcast never leaves the instance that received it.** `Hub._rooms`
+   is a dict in one process; `broadcast()` can only reach sockets in that dict.
+2. **A warm instance serves an indefinitely stale replica.** This one I didn't
+   expect and it's the better half of the story. Stage 2 loads a document once and
+   caches it forever. Instance `a` loaded this doc while it was empty, and nothing
+   ever invalidated that. It will keep answering `''` over HTTP for as long as the
+   process lives — Redis has to fix the read path, not just the broadcast.
+
+Nothing is *lost*: Postgres has every op, so a cold instance reads it correctly and
+a client reconnect heals. The system is stale, not lossy — which is exactly why it's
+tempting to ship and exactly why it's unacceptable for a live editor.
+
+**Why not just use sticky sessions?** `ip_hash` in nginx would pin each client to
+one instance and make the demo pass. It doesn't solve the problem: two *different*
+users still land on different instances and still can't see each other. It also
+breaks on any rebalance or instance restart, and it makes scaling uneven. Chose
+round-robin deliberately so the real requirement stays visible.
+
+## Files
+
+### `deploy/nginx.conf`
+Round-robin over two backends on :8080.
+- **The `map $http_upgrade $connection_upgrade` block is the load-bearing part.**
+  `Upgrade`/`Connection` are hop-by-hop headers and aren't forwarded by default, so
+  without it the WebSocket handshake arrives at the backend stripped and fails as a
+  plain HTTP request. Also needs `proxy_http_version 1.1` (default to upstreams is
+  1.0, which has no upgrade mechanism).
+- `proxy_read_timeout 1h` — an editor socket is idle whenever nobody types, and the
+  60s default would drop it mid-session.
+- **Tradeoff:** round-robin means a reconnecting client can land on a different
+  instance than before. Correct here because replicas are rebuildable, but it's the
+  thing sticky sessions exist to avoid.
+
+### `scripts/cluster.sh`
+`up` / `down` / `status` for two instances + nginx (+ Redis when `REDIS_URL` is set).
+- Runs everything unprivileged: nginx on :8080 with its own prefix under
+  `deploy/.run/`, so nothing touches the Homebrew config or launchd.
+- `uv run --directory server` so `app` is importable — uvicorn resolves the module
+  from cwd, which bit me first try.
+- Prints four `/healthz` responses at the end so you can watch round-robin
+  alternate before doing anything else.
+- **Tradeoff:** a shell script, not a process supervisor. No restart-on-crash, and
+  `down` has to pattern-match strays because `uv` spawns uvicorn as a child.
+
+### `server/scripts/multi_instance_demo.py`
+Opens sockets until two land on *different* instances, types on one, waits for the
+other. Reports whichever outcome it sees, so the same script is the before *and*
+after demo. Exit code 1 = didn't propagate.
+- Queries each instance directly (`:8001`, `:8002`) **and** rebuilds the document
+  straight from Postgres with no server involved — that three-way comparison is
+  what makes the stale-cache failure legible rather than confusing.
+
+### `server/app/main.py` (changed)
+`create_app(store, instance_id)`; `INSTANCE_ID` env with a random fallback.
+- Instance id is reported by `/healthz`, `/api/doc/{id}` **and every snapshot
+  frame**, so a browser tab can display which process it's talking to. Without that
+  the whole stage is unobservable.
+- **Tradeoff:** a random id when unset is friendly for one-off runs but means log
+  lines from an unconfigured instance aren't stable across restarts.

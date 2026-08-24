@@ -154,11 +154,12 @@ def test_documents_stay_separate_across_a_restart(pg_url: str) -> None:
 
 
 def test_an_untouched_document_is_empty_not_missing(pg_url: str) -> None:
-    with TestClient(create_app()) as client:
+    with TestClient(create_app(instance_id="solo")) as client:
         state = client.get("/api/doc/never-written").json()
         assert state == {
             "doc_id": "never-written",
             "text": "",
             "rev": 0,
             "clients": 0,
+            "instance": "solo",
         }

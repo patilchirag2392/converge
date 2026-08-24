@@ -27,3 +27,6 @@ yarn-error.log*
 .vscode/*
 !.vscode/extensions.json
 *.swp
+
+# Stage 3 cluster runtime (nginx logs, pidfiles)
+deploy/.run/
