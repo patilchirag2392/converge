@@ -296,3 +296,188 @@ after demo. Exit code 1 = didn't propagate.
   the whole stage is unobservable.
 - **Tradeoff:** a random id when unset is friendly for one-off runs but means log
   lines from an unconfigured instance aren't stable across restarts.
+
+## Step 2: the fix — Redis pub/sub
+
+Same script, same cluster, `REDIS_URL` now set:
+
+```
+  alice -> instance 'b'
+  bob   -> instance 'a'
+alice typed "typed on one instance"
+  alice sees: 'typed on one instance'
+  bob sees:   'typed on one instance'
+=> PROPAGATED in 14.1 ms across instances.
+
+what each instance thinks the document says:
+  instance a (:8001): 'typed on one instance'
+  instance b (:8002): 'typed on one instance'
+```
+
+Both Step 1 failures gone: the live broadcast crosses processes, **and** the
+warm instance is no longer stale, because it applies incoming ops to its cached
+replica.
+
+### The decision: what travels over Redis
+
+**The same operation dicts that travel over the WebSocket**, in a thin envelope
+(`doc_id`, `ops`, `origin`, `author`, `published_at`).
+
+The argument is about what kind of channel Redis pub/sub *is*: fire-and-forget,
+at-most-once, no replay, no ordering guarantee between publishers, and anything
+published while a subscriber is disconnected is gone. That is a weak channel.
+
+An op-based CRDT is the ideal payload for exactly that channel — ops are
+commutative (unordered delivery is fine), idempotent (duplicate delivery is
+fine), and self-contained (no prior context needed). **The properties the channel
+can't provide are the properties the payload doesn't need.**
+
+The alternative would be a "document X changed, go re-read Postgres"
+notification, which is what you'd be forced into if you were shipping *state*
+rather than operations: correctness would need ordering the channel can't give,
+so you'd fall back on the database as the tiebreak — an extra query per keystroke
+and a thundering herd on every edit. Sending whole documents was never on the
+table; that's Stage 0 with more steps.
+
+Zero translation is the other win: one format, one validator (`parse_op`), no
+second schema to keep in sync with the wire protocol.
+
+**Tradeoff:** a dropped message is silently lost. Survivable only because
+Postgres has every op, so a reconnect or cold load heals any gap. Redis is a
+*latency optimisation over the durable log*, not a second source of truth — and
+that's the sentence that justifies the whole design.
+
+### Ordering: persist → apply → broadcast locally → publish
+
+Persist first, always. If the write fails, nothing is applied, nothing is sent,
+nothing is published, and the client gets an error — rather than an edit that is
+visible on three machines and gone after a restart. Cost: propagation latency
+includes the Postgres commit. Publishing first would shave that off in exchange
+for visible-but-not-durable edits, which is a bad trade for an editor.
+
+**Local broadcast before publish** — and I got this backwards first. Publishing
+inside `apply_ops` before `main.py`'s local broadcast meant clients on the
+*originating* instance waited for the Redis round trip too. Not a correctness
+bug, and invisible by inspection — but the latency probe showed same-instance and
+cross-instance identical to two decimal places (1.50 ms vs 1.50 ms), which is not
+a plausible measurement. After moving the local fan-out ahead of the publish:
+same-instance dropped to 1.22 ms and the difference became real. **The metric
+found the flaw**, which is the argument for measuring rather than asserting.
+
+### Loop prevention: prevented, not just tolerated
+
+The loop is client → A → Redis → A. Handled by an explicit `origin ==
+instance_id` check that drops our own messages.
+
+Asked directly: am I relying on CRDT idempotency, or preventing duplicates? **Both,
+deliberately, at different layers.**
+
+- *Prevented* where it's exact and free: self-delivery. Idempotency would make it
+  harmless to state, but we'd still re-send ops to local clients that already
+  have them, and it would pollute the latency window with a ~0 ms self-sample.
+- *Tolerated* everywhere else, because pub/sub gives no delivery guarantees and
+  correctness must not depend on perfect dedup: redelivery, a client reconnecting
+  onto a different instance and replaying its snapshot, two instances both
+  hearing the same op. `test_a_duplicate_delivery_is_harmless` pins that.
+
+Remote ops are also **not re-persisted** (the origin committed them before
+publishing; writing again is pointless, though `ON CONFLICT` makes it harmless)
+and **not republished** (otherwise every instance rebroadcasts everything it
+hears and the cluster amplifies each edit without bound).
+
+### The measured number
+
+`scripts/latency_probe.py`, 60 samples, one process holding all three sockets so
+there is a single clock and no skew question:
+
+| | p50 | p95 | max |
+|---|---|---|---|
+| same-instance | 1.22 ms | 1.53 ms | 1.77 ms |
+| cross-instance | 1.56 ms | 1.86 ms | 2.14 ms |
+
+**The Redis hop costs ~0.34 ms at p50.** Both figures include the Postgres
+commit, so the difference isolates Redis. Independently corroborated by
+`/metrics`, which measures the publish→remote-handling leg from the servers' own
+clocks and reports p50 0.27–0.39 ms. Two different methods agreeing is the reason
+to trust either.
+
+## Files
+
+### `server/app/bus.py`
+`OpMessage` envelope + `Bus` protocol with four implementations: `RedisBus`,
+`NullBus` (single instance), `InProcessCluster`/`InProcessBus` (tests).
+- **One channel per document** (`converge:ops:{doc_id}`), not one global channel:
+  an instance shouldn't be woken by traffic for documents it isn't serving. Costs
+  subscription churn as rooms open and close.
+- One reader task drains the pubsub for the whole process, and **never lets an
+  exception kill the loop** — one malformed message must not stop delivery for
+  every other document on the instance.
+- Subscribes to a keepalive channel at startup because redis-py's `get_message`
+  needs at least one subscription to have a connection, and an instance starts
+  with no documents open.
+- `InProcessCluster` delivers to *every* bus **including the publisher's own**, on
+  purpose, so the loop-prevention path is exercised by tests rather than only in
+  production.
+- **Tradeoff:** `Bus` has four implementations, which is a lot of surface for one
+  behaviour. Justified by the tests running with no Redis at all.
+
+### `server/app/hub.py` (changed)
+Gains `bus`, `instance_id`, `attach`/`detach`, `apply_remote_ops`, and a latency
+window.
+- **`attach` subscribes *before* loading.** Load first and an op published between
+  the query and the subscription is lost to this instance — not in the rows we
+  read, and we weren't listening. Subscribe first and the worst case is an op we
+  also read from Postgres, which is a no-op.
+- **Invariant: a document is cached iff this instance is subscribed to it, iff it
+  has ≥1 local client.** `detach` unsubscribes and evicts together. This is the
+  fix for Step 1's second failure — a cached copy with nothing feeding it *is* the
+  stale-replica bug. It also retires Stage 2's "replicas cached forever" wart.
+- `document(cache=False)` for read-only callers, so a `curl` can't leave behind an
+  unsubscribed replica that answers stale forever.
+- **Tradeoff:** reopening a document re-reads Postgres. One query against being
+  confidently wrong.
+
+### `server/app/main.py` (changed)
+Lifespan builds a `RedisBus` when `REDIS_URL` is set, `NullBus` otherwise; adds
+`/metrics`.
+- Single-instance and clustered are **the same code with different config**, which
+  is what made the Step 1 → Step 2 comparison a config change rather than a
+  different branch.
+- The endpoint no longer broadcasts; `apply_ops` owns the whole ordering so it
+  lives in one documented place.
+- **Tradeoff:** `/metrics` is wall-clock based and so only trustworthy when the
+  instances' clocks agree. Documented in the handler and in the probe.
+
+### `server/tests/test_cluster.py` / `test_redis_bus.py`
+15 + 7 tests. Cluster semantics run on the in-process bus (fast, one event loop,
+deterministic); the Redis wiring gets its own integration file that skips when
+Redis is absent.
+- Loop prevention is asserted *observably*: after an edit, the origin instance's
+  latency window is empty and the remote's has exactly one sample.
+- **Tradeoff:** no test drives two `TestClient`s over one bus. Each `TestClient`
+  runs the app in its own event loop, so an in-process bus would have to await a
+  handler across loops. The real cross-process path is covered by the scripts
+  against the live cluster instead.
+
+### `server/scripts/latency_probe.py`
+Two probes on one instance, one on another, single `time.monotonic()` clock.
+- Reports same-instance and cross-instance separately so the difference isolates
+  Redis, and states what each figure includes.
+- 5 warm-up samples discarded.
+- **Tradeoff:** measures a loopback cluster on an idle machine. Real numbers need
+  real hosts and real load; this is a floor, not a capacity claim.
+
+### Client (`protocol.ts`, `useDocSocket.ts`, `App.tsx`)
+Snapshot carries `instance`; the UI shows it as a pill.
+- Without it the stage is unobservable — you can't tell whether two tabs are on
+  the same process, so you can't tell whether propagation is being tested at all.
+
+## Known limitation found at the end
+
+**Presence is per-instance now.** The `clients: n` pill counts sockets on *this*
+instance only, so two tabs on different instances both show `clients: 1`. Visible
+in the Stage 3 screenshot and wrong on its face.
+
+Not fixed here — it needs presence in Redis (a key per document with the union of
+connected clients, or a periodic broadcast of per-instance counts) which is its
+own design with its own expiry/liveness problem. Filed rather than hidden.

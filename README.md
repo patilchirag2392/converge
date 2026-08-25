@@ -12,20 +12,31 @@ Build plan and learning gates: [ROADMAP.md](./ROADMAP.md).
 
 ## Status
 
-**Stage 2 — Postgres persistence.** Documents survive a restart. The server keeps
-the CRDT's operation log in Postgres, rebuilds a replica from it on first access,
-and writes through before acknowledging an edit.
+**Stage 3 — horizontal scaling with Redis pub/sub.** Multiple server instances
+behind an nginx load balancer. Each instance holds its own WebSocket connections
+and its own CRDT replica; Redis carries operations between them so a client on one
+instance sees edits made on another.
 
-- [x] In-memory state replaced with Postgres, so docs survive a restart
-- [x] Schema designed here, queries hand-written (no ORM)
-- [x] Load a doc's state on connect, persist on change
+- [x] Two instances behind an Nginx load balancer
+- [x] Observed the break: clients on different instances couldn't see each other
+- [x] Redis pub/sub so edits broadcast across all instances
+- [x] Measured real cross-instance propagation latency
+
+**Measured, not estimated** (`scripts/latency_probe.py`, 60 samples, one process
+and one clock so there's no skew):
+
+| | p50 | p95 | max |
+|---|---|---|---|
+| same-instance | 1.22 ms | 1.53 ms | 1.77 ms |
+| cross-instance | 1.56 ms | 1.86 ms | 2.14 ms |
+
+The Redis hop costs **~0.34 ms at p50**. Both figures include the Postgres commit,
+since operations are persisted before they're published.
 
 Earlier stages are tagged: **`stage-0`** (last-write-wins, edits clobber each
-other) and **`stage-1`** (the CRDT, in memory only). `git checkout stage-0` to
-watch edits get destroyed.
+other), **`stage-1`** (the CRDT), **`stage-2`** (Postgres persistence).
 
-Build notes for this stage, including the persistence decision and its tradeoffs:
-[NOTES.md](./NOTES.md).
+Build notes and the decisions behind each stage: [NOTES.md](./NOTES.md).
 
 ## Run it
 
@@ -80,26 +91,105 @@ Step 3 is the interesting one. Editing offline works because operations commute
 and are idempotent, so sending them late merges exactly as well as sending them
 immediately.
 
+## Running a cluster
+
+```bash
+# two instances + nginx on :8080, with pub/sub
+REDIS_URL=redis://localhost:6379 scripts/cluster.sh up
+
+# and the client pointed at the load balancer instead of one instance
+cd client && VITE_WS_URL=ws://localhost:8080 npm run dev
+```
+
+`scripts/cluster.sh status` shows what's listening; `down` stops it. Everything
+runs unprivileged — nginx on :8080 with its own prefix under `deploy/.run/`.
+
+Open two tabs on <http://localhost:5173/?doc=demo> and check the `instance:` pill:
+round-robin means they usually land on **different** processes. Type in one and it
+appears in the other, having crossed through Redis.
+
+### Watching it break first
+
+The interesting part of this stage is the failure. Start the cluster *without*
+Redis:
+
+```bash
+scripts/cluster.sh up                                  # no REDIS_URL
+cd server && uv run python scripts/multi_instance_demo.py
+```
+
+```
+  alice -> instance 'b'
+  bob   -> instance 'a'
+alice typed "typed on one instance"
+  alice sees: 'typed on one instance'
+  bob sees:   ''
+=> DID NOT PROPAGATE within 3s.
+
+what each instance thinks the document says:
+  instance a (:8001): ''
+  instance b (:8002): 'typed on one instance'
+straight from Postgres:     'typed on one instance'
+```
+
+**Two failures, one cause — state lives per process:**
+
+1. The live broadcast never leaves the instance that received it. `Hub._rooms` is
+   a dict in one process, so `broadcast()` can only reach sockets in that dict.
+2. A warm instance serves an indefinitely stale replica. Instance `a` loaded the
+   document while it was empty and nothing ever invalidated that, so it will keep
+   answering `''` for as long as the process lives.
+
+Nothing is *lost* — Postgres has every operation, so a cold instance reads it
+correctly and a reconnect heals. The system is **stale, not lossy**, which is
+exactly why it's tempting to ship and exactly why it's unacceptable for a live
+editor.
+
+Then set `REDIS_URL` and run the identical script: it propagates, and both
+instances agree.
+
+**Why not sticky sessions?** `ip_hash` in nginx would pin each client to one
+instance and make that demo pass. It doesn't fix anything: two *different* users
+still land on different instances and still can't see each other. It also breaks
+on any rebalance or restart. Round-robin is deliberate so the real requirement
+stays visible.
+
+---
+
 ## Architecture
 
 ```
-┌──────────── Tab A ────────────┐          ┌──────── FastAPI (1 process) ────────┐
-│ React + TS                    │   ops    │                                     │
-│  <textarea>                   │  ──────► │  Hub                                 │
-│  useDocSocket()               │   JSON   │   docs:  {doc_id -> Document}        │
-│  RGA replica  ◄───────────────┼──────────┤            Document{ RGA replica }   │
-│   crdt.ts                     │          │   conns: {doc_id -> {client_id: ws}} │
-└───────────────────────────────┘          │                                      │
-┌──────────── Tab B ────────────┐          │  merges the same ops into its own    │
-│ RGA replica  ◄────────────────┼─────────►│  replica, then relays them verbatim  │
-└───────────────────────────────┘          └──────────────────┬──────────────────┘
-        three replicas, each                    writes through │ before acking
-        converging on its own                                  ▼
-                                             ┌─────────────────────────────────┐
-                                             │ Postgres: operations (op log)   │
-                                             │  one row per insert/delete      │
-                                             └─────────────────────────────────┘
+                          ┌─────────────┐
+   browser tabs ─────────►│    nginx    │  round-robin, :8080
+                          └──┬───────┬──┘
+             ┌───────────────┘       └───────────────┐
+             ▼                                      ▼
+   ┌──────────────────────┐              ┌──────────────────────┐
+   │  instance a  :8001   │              │  instance b  :8002   │
+   │  Hub                 │              │  Hub                 │
+   │   its own sockets    │              │   its own sockets    │
+   │   its own replicas   │              │   its own replicas   │
+   └─────┬──────────┬─────┘              └─────┬──────────┬─────┘
+         │          │   subscribe / publish    │          │
+         │          └──────────┐   ┌───────────┘          │
+         │                     ▼   ▼                      │
+         │            ┌──────────────────────┐            │
+         │            │ Redis pub/sub        │            │
+         │            │ converge:ops:{doc}   │            │
+         │            └──────────────────────┘            │
+         │                                                │
+         │   persist BEFORE publishing                    │
+         └────────────────┐              ┌────────────────┘
+                          ▼              ▼
+                  ┌──────────────────────────────┐
+                  │ Postgres: operations         │  the source of truth
+                  └──────────────────────────────┘
 ```
+
+Every browser tab, and every server instance, holds a full CRDT replica. Redis is
+a *live delivery layer over the durable log* — never a second source of truth. If
+it drops a message, Postgres still has the operation and the next reconnect or
+cold load heals the gap.
 
 The same algorithm is implemented twice — `server/app/crdt.py` and
 `client/src/crdt.ts` — so the server is a real participant rather than a referee.
@@ -282,6 +372,89 @@ have clobbered every other tab.
 
 ---
 
+## How cross-instance propagation works
+
+### What travels over Redis
+
+**The same operation dicts that travel over the WebSocket**, in a thin envelope:
+
+```jsonc
+{"doc_id": "demo",
+ "ops": [{"kind": "insert", "id": ["a7f", 12], "parent": ["b31", 4], "value": "x"}],
+ "origin": "a",              // publishing instance, used to drop our own messages
+ "author": "a7f",            // client that made the edit
+ "published_at": 1787604469.812}
+```
+
+The argument for that choice is about what kind of channel Redis pub/sub *is*:
+fire-and-forget, at-most-once, no replay, no ordering guarantee between
+publishers, and anything published while a subscriber is disconnected is gone.
+That's a weak channel.
+
+An op-based CRDT is the ideal payload for exactly that channel. Operations are
+commutative, so unordered delivery is fine; idempotent, so duplicate delivery is
+fine; self-contained, so a subscriber needs no prior context. **The guarantees the
+channel can't give are the guarantees the payload doesn't need.**
+
+The alternative — a "document X changed, go re-read Postgres" notification — is
+what you'd be forced into if you shipped *state*, because correctness would need
+ordering the channel can't provide. That costs a query per keystroke and a
+thundering herd on every edit.
+
+**One channel per document** (`converge:ops:{doc_id}`), so an instance isn't woken
+by traffic for documents it isn't serving.
+
+### Ordering: persist → apply → broadcast locally → publish
+
+Every step is deliberate:
+
+- **Persist first.** If the write fails, nothing is applied, sent, or published,
+  and the client gets an error — rather than an edit that's visible on three
+  machines and gone after a restart. Cost: propagation includes the Postgres
+  commit.
+- **Local broadcast before publish**, so clients on the originating instance don't
+  wait on a Redis round trip to see their neighbour's typing.
+
+That second one was wrong at first, and the *metric* caught it: same-instance and
+cross-instance came out identical to two decimal places, which isn't a plausible
+measurement. Moving the local fan-out ahead of the publish dropped same-instance
+from 1.50 ms to 1.22 ms and made the comparison mean something.
+
+### Not looping, not double-applying
+
+The loop to worry about is client → instance A → Redis → instance A. Every message
+carries the publishing instance's id, and a receiver drops its own.
+
+Both prevention *and* tolerance, at different layers, on purpose:
+
+- **Prevented** where it's exact and free — self-delivery. Idempotency would make
+  it harmless to state, but we'd still re-send operations to local clients that
+  already have them, and it would pollute the latency window with ~0 ms samples.
+- **Tolerated** everywhere else, because pub/sub gives no delivery guarantees and
+  correctness must never depend on perfect dedup: redelivery, a client reconnecting
+  onto a different instance and replaying its snapshot, two instances hearing the
+  same operation.
+
+Operations arriving from Redis are **not re-persisted** (the origin committed them
+before publishing) and **not republished** (otherwise every instance rebroadcasts
+what it hears and the cluster amplifies each edit without bound).
+
+### The invariant that keeps replicas honest
+
+**A document is cached in a process if and only if that process is subscribed to
+it, which is if and only if it has at least one local client.** `attach`
+subscribes then loads then registers; `detach` unsubscribes and evicts together.
+
+Subscribing *before* loading closes the join race: load first and an operation
+published between the query and the subscription is lost to that instance. Doing
+it in this order, the worst case is receiving an operation that was also in the
+rows we read — a no-op, because applying is idempotent.
+
+Break that invariant and you get the Stage 3 stale-replica bug back: a cached copy
+with nothing feeding it.
+
+---
+
 ## What Stage 1 fixes, measured
 
 Same scenario that destroyed data in Stage 0, verified against a live server and in
@@ -339,8 +512,20 @@ Being able to state these is worth more than hiding them.
 - **Schema changes have no migration path.** `schema.sql` is applied with
   `IF NOT EXISTS` on every boot. Fine while the schema only grows, wrong the first
   time a column has to change — that's when this wants alembic or sqitch.
-- **Every replica is cached in memory forever.** Nothing evicts a document once
-  loaded, so a server that has served many documents holds them all.
+- **Presence is per-instance.** The `clients: n` pill counts sockets on *this*
+  instance only, so two tabs on different instances each show `clients: 1`. Needs
+  presence in Redis (a key per document, or periodic per-instance count
+  broadcasts) with its own expiry and liveness design.
+- **A dropped Redis message is silently lost.** Pub/sub is at-most-once with no
+  replay, so an instance disconnected from Redis misses everything published in
+  the gap. Survivable only because Postgres has every operation — a reconnect or
+  cold load heals it. A stricter design would use Redis Streams with consumer
+  groups and acknowledgements.
+- **`/metrics` uses wall clocks on two machines.** Meaningful on one host,
+  unreliable across hosts. `scripts/latency_probe.py` is the trustworthy
+  measurement because it uses a single clock.
+- **Cluster orchestration is a shell script.** No supervision, no restart-on-crash,
+  and `down` pattern-matches stray processes. Stage 4's Docker Compose replaces it.
 - **Lone UTF-16 surrogates can't be persisted.** Python's `len()` says one
   character so the CRDT accepts one, but it can't be encoded as UTF-8 and the write
   fails (rolling the frame back correctly). Reaching it requires an edit *inside* an
@@ -388,6 +573,13 @@ Being able to state these is worth more than hiding them.
    descending, which is a total order, so all of them compute the same sequence with
    no coordination.
 
+**Stage 3 — scaling.** Explain why two instances break sync and how pub/sub fixes
+it. The load-bearing parts: that broadcast state is per process (and that the
+*stale cached replica* is the same bug in the read path), why operations are the
+right thing to put on a weak channel, why persistence happens before publishing,
+how the self-echo loop is prevented, and what the measured latency figure does and
+doesn't include.
+
 **Stage 2 — persistence.** Explain the schema and why it stores what it stores, in
 that shape. The load-bearing parts: why the primary key is the operation's identity
 (idempotency for free), why an operation log rather than materialized state (for
@@ -399,18 +591,25 @@ doesn't matter, and why writes happen before broadcasts.
 ```
 NOTES.md                   per-file build notes and decisions for Stage 2
 shared/crdt-vectors.json   cases both test suites assert, pinning the two implementations
+deploy/nginx.conf          load balancer: round-robin, WebSocket upgrade headers
+scripts/cluster.sh         two instances + nginx (+ Redis), up / down / status
 server/
   app/crdt.py              the CRDT: ids, insert-after, sibling order, tombstones, buffering
+  app/bus.py               Redis pub/sub: the envelope, per-document channels, the reader
   app/schema.sql           the two tables, the constraints, the index
   app/store.py             every SQL statement in the project, as readable constants
   app/db.py                connection pool + schema application
   app/hub.py               replicas (loaded from Postgres) + connection rooms
   app/main.py              create_app(), WebSocket endpoint, wire protocol
   scripts/race_demo.py     the Stage 0 race, now merging cleanly
+  scripts/multi_instance_demo.py  does an edit cross instances? reports either answer
+  scripts/latency_probe.py conversation-ready latency numbers, measured on one clock
   scripts/gen_vectors.py   regenerates the shared vectors
   tests/test_crdt.py       31 tests, incl. every permutation of a concurrent edit set
   tests/test_store.py      12 tests against real Postgres, incl. the CHECK constraints
   tests/test_persistence.py 8 restart tests, each block a separate server lifetime
+  tests/test_cluster.py    15 cross-instance tests on an in-process bus
+  tests/test_redis_bus.py  7 integration tests against real Redis
 client/
   src/crdt.ts              mirror of crdt.py
   src/diff.ts              <textarea> value -> operations
