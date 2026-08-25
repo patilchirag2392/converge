@@ -18,7 +18,7 @@ works.
 | 0 | last-write-wins, edits clobber | done, tagged `stage-0` |
 | 1 | hand-written RGA CRDT | done, **not tagged, not merged** |
 | 2 | Postgres persistence (op log) | done, **not tagged, not merged** |
-| 3 | Redis pub/sub across 2 instances | done, **not tagged, not merged, not pushed** |
+| 3 | Redis pub/sub across 2 instances | done and pushed, **not tagged, not merged** |
 | 4 | Docker + GitHub Actions | not started |
 | 5 | Deploy to AWS | not started |
 
@@ -32,13 +32,14 @@ verified in a throwaway worktree, not assumed.
 main              e801044   Stage 0 only (+ one demo fix)     [pushed]
 stage-1-crdt      f433c0a   Stage 1                            [pushed]
 stage-2-postgres  f0a0955   Stage 1 + 2                        [pushed]
-stage-3-redis     dcf8d78   Stage 1 + 2 + 3  ← current branch  [NOT pushed]
+stage-3-redis     (tip)     Stage 1 + 2 + 3  ← current branch  [pushed]
 tags              stage-0                                      [pushed]
 ```
 
 **Nothing has been merged to `main` since Stage 0.** Each stage branch builds on
-the previous one, so `stage-3-redis` carries all three stages' work — 17 commits
-ahead of `origin/main`. The branch names no longer line up with what's in each.
+the previous one, so `stage-3-redis` carries all three stages' work, well ahead
+of `origin/main`. The branch names no longer line up with what's in each.
+All four branches are on GitHub; only `main` lacks stages 1–3.
 
 That's a deliberate consequence of the roadmap's rule ("merge when the stage's
 learn-gate passes") plus the fact that **no learn-gate has been done for Stages
@@ -102,24 +103,22 @@ as visual evidence of the progression.
 
 ## Loose ends, roughly in priority order
 
-1. **`stage-3-redis` is not pushed.** Everything else is. Push when ready:
-   `git push -u origin stage-3-redis`.
-2. **No learn-gate done for Stages 1, 2 or 3**, and no `stage-1`/`stage-2`/
+1. **No learn-gate done for Stages 1, 2 or 3**, and no `stage-1`/`stage-2`/
    `stage-3` tags. The roadmap gates merging on being able to explain the stage
    without looking. Either do the gates and merge+tag each, or decide to catch up
    in one go. The questions are in the README under *Learn-gates*.
-3. **`main` is three stages behind.** The longer this drifts, the less the history
+2. **`main` is three stages behind.** The longer this drifts, the less the history
    reads like the roadmap — which was the point of the branch-per-stage rule.
-4. **Presence is per-instance** (found at the end of Stage 3). The `clients: n`
+3. **Presence is per-instance** (found at the end of Stage 3). The `clients: n`
    pill counts only sockets on the instance you're connected to, so two tabs on
    different instances each show `clients: 1`. Visibly wrong. Needs presence in
    Redis with its own expiry/liveness design.
-5. **Stage 4 is next:** Dockerfile per service, docker-compose for one-command
+4. **Stage 4 is next:** Dockerfile per service, docker-compose for one-command
    spin-up, GitHub Actions running tests on push. Note Docker is **not installed**
    on this machine. CI will need Postgres and Redis service containers, and the
    test suites already skip cleanly when either is absent — worth wiring so they
    *don't* skip in CI, otherwise the database tests silently never run.
-6. **`scripts/cluster.sh` gets replaced by docker-compose** in Stage 4. It's a
+5. **`scripts/cluster.sh` gets replaced by docker-compose** in Stage 4. It's a
    shell script with no supervision and a `down` that pattern-matches strays.
 
 ---
