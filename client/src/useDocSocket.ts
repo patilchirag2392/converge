@@ -31,6 +31,9 @@ export interface DocSocket {
   status: Status;
   clients: number;
   clientId: string;
+  /** Server process this tab is connected to; changes if it reconnects through
+   *  the load balancer onto a different one. */
+  instance: string;
   events: RemoteEvent[];
   /** Operations typed while disconnected, waiting to be sent. */
   queued: number;
@@ -77,6 +80,7 @@ export function useDocSocket(docId: string): DocSocket {
   const [rev, setRev] = useState(0);
   const [status, setStatus] = useState<Status>('connecting');
   const [clients, setClients] = useState(0);
+  const [instance, setInstance] = useState('');
   const [events, setEvents] = useState<RemoteEvent[]>([]);
   const [queued, setQueued] = useState(0);
 
@@ -209,6 +213,7 @@ export function useDocSocket(docId: string): DocSocket {
             // we already have is a no-op, so merging is always correct.
             merge(message.ops);
             setClients(message.clients);
+            setInstance(message.instance);
             flush();
 
             if (hadLocalState) replayLocalState();
@@ -286,5 +291,16 @@ export function useDocSocket(docId: string): DocSocket {
     [queue],
   );
 
-  return { text, rev, status, clients, clientId, events, queued, textareaRef, onChange };
+  return {
+    text,
+    rev,
+    status,
+    clients,
+    clientId,
+    instance,
+    events,
+    queued,
+    textareaRef,
+    onChange,
+  };
 }

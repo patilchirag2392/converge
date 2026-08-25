@@ -95,6 +95,11 @@ body {
   border-color: color-mix(in oklab, var(--warn) 40%, var(--border));
 }
 
+.pill.instance {
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--border));
+}
+
 .ins {
   color: var(--ok);
 }

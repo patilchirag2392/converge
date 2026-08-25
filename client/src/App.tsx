@@ -8,20 +8,31 @@ function readDocId(): string {
 const DOC_ID = readDocId();
 
 export default function App() {
-  const { text, rev, status, clients, clientId, events, queued, textareaRef, onChange } =
-    useDocSocket(DOC_ID);
+  const {
+    text,
+    rev,
+    status,
+    clients,
+    clientId,
+    instance,
+    events,
+    queued,
+    textareaRef,
+    onChange,
+  } = useDocSocket(DOC_ID);
 
   return (
     <div className="app">
       <header className="bar">
         <div className="brand">
           <strong>Converge</strong>
-          <span className="stage">Stage 2 · CRDT + Postgres</span>
+          <span className="stage">Stage 3 · CRDT + Postgres + Redis</span>
         </div>
         <div className="meta">
           <span className={`pill status-${status}`}>{status}</span>
           <span className="pill">doc: {DOC_ID}</span>
           <span className="pill">tab: {clientId}</span>
+          {instance && <span className="pill instance">instance: {instance}</span>}
           <span className="pill">clients: {clients}</span>
           <span className="pill">ops: {rev}</span>
           {queued > 0 && <span className="pill queued">queued: {queued}</span>}

@@ -18,6 +18,9 @@ export type ServerMessage =
       rev: number;
       clients: number;
       client_id: string;
+      /** Which server process this tab is talking to. Stage 3: with a load
+       *  balancer in front, two tabs on the same URL can land on different ones. */
+      instance: string;
     }
   | { type: 'ops'; ops: Operation[]; rev: number; author: string }
   | { type: 'presence'; clients: number }
