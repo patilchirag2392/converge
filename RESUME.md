@@ -92,6 +92,12 @@ uv run python scripts/gen_vectors.py          # regenerate shared CRDT vectors
 `multi_instance_demo.py` reports whichever outcome it observes, so it's the
 before *and* after demo — exit 1 without Redis, 0 with it.
 
+**Browser-level checks live in `e2e/`** (see its README): concurrent editing and
+caret behaviour, killing the server mid-session, and two tabs forced onto
+different instances. They need a running stack and a real browser, so they're
+manual rather than part of `npm test`. `e2e/screenshots/` has one image per stage
+as visual evidence of the progression.
+
 ---
 
 ## Loose ends, roughly in priority order
