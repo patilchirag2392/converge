@@ -30,3 +30,8 @@ yarn-error.log*
 
 # Stage 3 cluster runtime (nginx logs, pidfiles)
 deploy/.run/
+
+# e2e driver (installed on demand, see e2e/README.md)
+e2e/node_modules/
+e2e/package.json
+e2e/package-lock.json
