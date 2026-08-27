@@ -78,7 +78,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to an exact release, not a major alias: setup-uv publishes
+      # moving tags only up to v7, so `@v10` does not resolve even though
+      # v10.0.1 is the current release. Exact pins are the better default for
+      # CI anyway -- the action cannot change under the workflow.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           # 3.11 everywhere: the local .venv, the Dockerfile base image, and
           # here. uv.lock was resolved against it.
@@ -170,7 +174,11 @@ jobs:
             exit 1
           fi
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to an exact release, not a major alias: setup-uv publishes
+      # moving tags only up to v7, so `@v10` does not resolve even though
+      # v10.0.1 is the current release. Exact pins are the better default for
+      # CI anyway -- the action cannot change under the workflow.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.11"
           enable-cache: true
