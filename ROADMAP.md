@@ -104,9 +104,9 @@ unique ID, (c) how two clients inserting at the same position end up in the same
 ---
 
 ### Stage 4 — Containerize + CI/CD (NEW: Docker, GitHub Actions)
-- [ ] Dockerfile per service
-- [ ] docker-compose for one-command local spin-up
-- [ ] GitHub Actions: run tests + build on every push
+- [x] Dockerfile per service
+- [x] docker-compose for one-command local spin-up
+- [x] GitHub Actions: run tests + build on every push
 
 **Learn-gate:** Explain what your Dockerfile does line by line, and what your pipeline runs.
 

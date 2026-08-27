@@ -1,17 +1,17 @@
 # Resume here
 
-Session handoff for Converge. Written 2026-08-25. Paste this file (or point at it)
-to bring a fresh session up to speed.
+Session handoff for Converge. Written 2026-08-25, updated 2026-08-26 after
+Stage 4. Paste this file (or point at it) to bring a fresh session up to speed.
 
 Companion docs: [ROADMAP.md](./ROADMAP.md) is the plan, [NOTES.md](./NOTES.md) is
-the per-file decision trail for Stages 2–3, [README.md](./README.md) is how it all
+the per-file decision trail for Stages 2–4, [README.md](./README.md) is how it all
 works.
 
 ---
 
 ## Where things stand
 
-**Stages 0–3 are built and verified. Stage 4 (Docker + CI) is next and untouched.**
+**Stages 0–4 are built and verified. Stage 5 (AWS) is next and untouched.**
 
 | Stage | What | State |
 |---|---|---|
@@ -19,7 +19,7 @@ works.
 | 1 | hand-written RGA CRDT | done, **not tagged, not merged** |
 | 2 | Postgres persistence (op log) | done, **not tagged, not merged** |
 | 3 | Redis pub/sub across 2 instances | done and pushed, **not tagged, not merged** |
-| 4 | Docker + GitHub Actions | not started |
+| 4 | Docker + GitHub Actions | done, **not pushed** — so CI has never run |
 | 5 | Deploy to AWS | not started |
 
 Tests: **103 server** (`cd server && uv run pytest`), **43 client**
@@ -29,29 +29,58 @@ verified in a throwaway worktree, not assumed.
 ### Git topology — read this before doing anything
 
 ```
-main              e801044   Stage 0 only (+ one demo fix)     [pushed]
+main              e801044   Stage 0 only (+ one demo fix)      [pushed]
 stage-1-crdt      f433c0a   Stage 1                            [pushed]
 stage-2-postgres  f0a0955   Stage 1 + 2                        [pushed]
-stage-3-redis     (tip)     Stage 1 + 2 + 3  ← current branch  [pushed]
+stage-3-redis     cf6a626   Stage 1 + 2 + 3                    [pushed]
+stage-4-docker-ci (tip)     Stage 1 + 2 + 3 + 4 ← current      [NOT pushed]
 tags              stage-0                                      [pushed]
 ```
 
+**`stage-4-docker-ci` has never been pushed, which means the GitHub Actions
+workflow has never run.** That is the single biggest open item: the workflow is
+desk-checked and every step was verified by hand against the local stack, but
+"goes green" is unproven. Pushing the branch is what proves it.
+
 **Nothing has been merged to `main` since Stage 0.** Each stage branch builds on
-the previous one, so `stage-3-redis` carries all three stages' work, well ahead
-of `origin/main`. The branch names no longer line up with what's in each.
-All four branches are on GitHub; only `main` lacks stages 1–3.
+the previous one, so `stage-4-docker-ci` carries all four stages' work, well
+ahead of `origin/main`. The branch names no longer line up with what's in each.
+Four branches are on GitHub; `stage-4-docker-ci` is local only.
 
 That's a deliberate consequence of the roadmap's rule ("merge when the stage's
 learn-gate passes") plus the fact that **no learn-gate has been done for Stages
-1, 2 or 3**. Decide whether to keep gating or catch up — see loose ends below.
+1, 2, 3 or 4**. Decide whether to keep gating or catch up — see loose ends below.
 
 ---
 
 ## Getting running again
 
-Everything is installed via Homebrew. Postgres runs as a launchd service; Redis and
-nginx do **not** (started ad-hoc by the cluster script, deliberately, so nothing
-was registered permanently).
+### The easy way, as of Stage 4
+
+```bash
+cd ~/Developer/converge
+colima start                       # the VM does NOT run at login
+docker compose up --build          # six containers, ~17s to healthy
+```
+
+Then <http://localhost:5173/?doc=demo> in two tabs. `docker compose down` to
+stop, `down -v` to also drop the Postgres volume.
+
+**Docker is installed now** (it wasn't when Stage 4 started): Colima 0.10.3 plus
+the docker CLI, buildx and compose plugins, all via Homebrew — no Docker Desktop.
+Nothing registers at login, matching how Redis and nginx were already handled.
+`colima status` / `colima stop`.
+
+Ports under compose: 5173 client · 8080 nginx · 8001/8002 the two instances ·
+**55432** Postgres · **56379** Redis. The last two are deliberately not the
+default ports, so they can't collide with — or be confused for — the Homebrew
+Postgres and Redis.
+
+### The host-process way, still the best loop for editing code
+
+`--reload`, real debuggers, no rebuild. Everything is installed via Homebrew.
+Postgres runs as a launchd service; Redis and nginx do **not** (started ad-hoc
+by the cluster script, deliberately, so nothing was registered permanently).
 
 ```bash
 cd ~/Developer/converge
@@ -78,7 +107,10 @@ Create with `createdb` if missing.
 
 **Env vars:** `DATABASE_URL` (default `postgresql:///converge`), `REDIS_URL`
 (unset = single-instance mode, no pub/sub), `INSTANCE_ID`, `VITE_WS_URL`,
-`TEST_DATABASE_URL`, `TEST_REDIS_URL`.
+`TEST_DATABASE_URL`, `TEST_REDIS_URL`, and from Stage 4
+`CONVERGE_CONNECT_TIMEOUT` (startup retry budget, default 30s), `LOG_LEVEL`,
+`CONVERGE_REQUIRE_SERVICES` (turns test skips into failures — CI sets it).
+All of them, with defaults, are in `.env.example`.
 
 ### Demo scripts, all real
 
@@ -103,8 +135,7 @@ as visual evidence of the progression.
 
 ## Loose ends, roughly in priority order
 
-1. **No learn-gate done for Stages 1, 2 or 3**, and no `stage-1`/`stage-2`/
-   `stage-3` tags. The roadmap gates merging on being able to explain the stage
+1. **No learn-gate done for Stages 1, 2, 3 or 4**, and no `stage-1`…`stage-4` tags. The roadmap gates merging on being able to explain the stage
    without looking. Either do the gates and merge+tag each, or decide to catch up
    in one go. The questions are in the README under *Learn-gates*.
 2. **`main` is three stages behind.** The longer this drifts, the less the history
@@ -113,13 +144,26 @@ as visual evidence of the progression.
    pill counts only sockets on the instance you're connected to, so two tabs on
    different instances each show `clients: 1`. Visibly wrong. Needs presence in
    Redis with its own expiry/liveness design.
-4. **Stage 4 is next:** Dockerfile per service, docker-compose for one-command
-   spin-up, GitHub Actions running tests on push. Note Docker is **not installed**
-   on this machine. CI will need Postgres and Redis service containers, and the
-   test suites already skip cleanly when either is absent — worth wiring so they
-   *don't* skip in CI, otherwise the database tests silently never run.
-5. **`scripts/cluster.sh` gets replaced by docker-compose** in Stage 4. It's a
-   shell script with no supervision and a `down` that pattern-matches strays.
+4. **The CI workflow has never run.** `stage-4-docker-ci` isn't pushed. Every
+   step was verified by hand locally — pytest under `CONVERGE_REQUIRE_SERVICES=1`,
+   the round-robin shell snippet verbatim, `compose build`, `compose up --wait`,
+   the demo — but GitHub Actions can't be run locally, so the workflow as a whole
+   is unproven. Push the branch and watch it.
+5. **A Redis restart reports a false error** (found during Stage 4, filed not
+   fixed). The first edit after Redis is replaced gets
+   `"could not persist operations"` — which is untrue: the ops *are* in Postgres
+   and local clients *did* see them; only the cross-instance publish failed. Two
+   defects: no publish retry on the bus, and one exception handler covering two
+   failure modes with opposite consequences. Deterministic repro and full
+   diagnosis in NOTES.md. Doesn't affect a clean-state `compose up`.
+6. **`VITE_WS_URL` is baked into the client image at build time** (Vite inlines
+   `import.meta.env.VITE_*`), so the client image is environment-specific. This
+   needs solving *before* Stage 5 puts it behind a real hostname — runtime
+   injection via an entrypoint that writes a `config.js` the app reads.
+7. **`scripts/cluster.sh` survives on purpose.** compose replaced it for
+   everything except running the stack as bare host processes, which is still
+   the fastest loop for code changes. It's still a shell script with no
+   supervision and a `down` that pattern-matches strays.
 
 ---
 
@@ -161,6 +205,25 @@ depend on perfect dedup.
 **Invariant worth protecting:** a document is cached in a process **iff** that
 process is subscribed to it **iff** it has ≥1 local client. Break it and the
 Stage 3 stale-replica bug comes back.
+
+**Stage 4 — healthchecks *and* retry-on-connect, both deliberately.** Bare
+`depends_on` does not wait for Postgres to accept connections; it waits for the
+container to be *started*. `condition: service_healthy` does wait, and is used
+everywhere — but it isn't sufficient, for three reasons: a healthcheck can lie
+(socket-based `pg_isready` reports READY during `initdb`, so the compose file
+forces TCP with `-h 127.0.0.1`), healthy at t=0 says nothing about t=1, and
+`depends_on` doesn't exist outside compose. Healthchecks make the common case
+fast and the logs clean; the app's retry loop is the half that's actually
+correct and the half that still exists on ECS.
+
+**Stage 4 — multi-stage because layers are additive, not because of `--no-dev`.**
+A single-stage image that genuinely `rm`s `uv` and the wheel cache is still 51 MB
+bigger than the multi-stage one, because a file added in one layer and deleted in
+a later one is still shipped. Multi-stage works because the final stage starts
+clean and receives only what a `COPY --from` names. Measured numbers in NOTES.md.
+
+**Stage 4 — two explicit server services, not `deploy: replicas: 2`.** Replicas
+can't have distinct `INSTANCE_ID`s, and without those the stage is unobservable.
 
 ### The measured number (real, one clock, no skew)
 
@@ -214,7 +277,23 @@ independently by `/metrics` (0.27–0.39 ms for the publish→remote-handling le
   `git worktree add --detach` plus the existing venv's python
   (`server/.venv/bin/python -m pytest`) instead.
 - Postgres is a **brew service**; Redis and nginx are started **ad-hoc** by
-  `scripts/cluster.sh`, so nothing extra runs at login.
+  `scripts/cluster.sh`, so nothing extra runs at login. Colima is the same —
+  `colima start` by hand, nothing at login.
+- **`~/.docker` held a dead Docker Desktop install** (`credsStore: "desktop"`,
+  `currentContext: "desktop-linux"`, and 14 dangling plugin symlinks into a
+  deleted `/Applications/Docker.app`). `credsStore` pointing at a missing
+  binary breaks `docker pull` on its own. Cleaned up; the original is at
+  `~/.docker/config.json.bak-pre-colima`. `cliPluginsExtraDirs` now points at
+  `/opt/homebrew/lib/docker/cli-plugins` so `docker compose` and `docker buildx`
+  resolve as subcommands.
+- **A virtualenv can't be relocated between build stages.** It records its own
+  path in `pyvenv.cfg` and in console-script shebangs, so the Dockerfile copies
+  it to the same `/app/.venv` it was built at.
+- **Use exec-form `CMD`.** Shell form makes `/bin/sh` PID 1, and sh doesn't
+  forward SIGTERM, so `compose down` waits out the grace period and SIGKILLs —
+  skipping the lifespan shutdown. `Started server process [1]` is the check.
+- **`docker compose logs` shows nothing from the app unless logging is
+  configured.** uvicorn configures its own loggers and leaves the root alone.
 
 ---
 
