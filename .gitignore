@@ -19,7 +19,13 @@ yarn-error.log*
 # Env / secrets
 .env
 .env.*
-!.env.example
+# Templates are the exception, and the glob has to cover all of them.
+# `!.env.example` alone silently ignored deploy/aws/.env.production.example,
+# which bootstrap.sh copies on the box -- so the file existed locally, was never
+# committed, and the deploy would have failed with "no such file". Caught with
+# `git check-ignore -v` before the first commit; worth remembering that an
+# ignored file you depend on fails somewhere else entirely.
+!.env*.example
 
 # Editors / OS
 .DS_Store

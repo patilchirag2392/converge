@@ -1,0 +1,118 @@
+# Converge -- production overlay for a single EC2 box.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# An overlay, not a replacement: the topology, healthchecks and startup ordering
+# are already correct in docker-compose.yml and duplicating them would let the
+# two drift. This file changes exactly three things:
+#
+#   1. Closes every published port except the edge. Nothing but nginx is
+#      reachable from outside the box.
+#   2. Puts nginx on port 80 and gives it the production config, where it serves
+#      the client bundle *and* proxies the API -- one origin, one open port.
+#   3. Refuses to start on a default password.
+#
+# Requires Docker Compose v2.24+ for the `!reset` tag. `docker compose version`.
+
+# ---------------------------------------------------------------------------
+# THE PORT-CLOSING TRAP, and why every service below names `ports` explicitly.
+#
+# Compose *merges* the `ports` list across files -- it does not replace it. An
+# overlay that simply doesn't mention `ports` inherits the base file's, so a
+# "production" overlay written the obvious way would leave Postgres published
+# on 55432 to the whole internet. Verified, not assumed:
+#
+#   docker compose -f docker-compose.yml -f <overlay-without-ports> config
+#
+# still prints `published: "55432"`. `!reset []` is what actually removes it.
+#
+# The security group is the second line of defence, not the first. Both matter:
+# a published container port punches through the host firewall via iptables
+# rules Docker writes itself, so "the security group will save me" is a habit
+# worth not forming.
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    # Not reachable from outside the Docker network. Full stop. server-a and
+    # server-b reach it as `postgres:5432` over the compose bridge.
+    ports: !reset []
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-converge}
+      # `:?` makes compose refuse to start if this is unset or empty. The base
+      # file defaults it to "converge" for local development; in production a
+      # forgotten password must be a startup failure, not a default credential
+      # on a public box.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env on the box}
+      POSTGRES_DB: ${POSTGRES_DB:-converge}
+
+  redis:
+    # Same reasoning, and more urgent: Redis has no authentication configured,
+    # so a published 6379 is an open remote-code-execution surface. It is
+    # exposed to the compose network only.
+    ports: !reset []
+
+  server-a:
+    # Closed. The instances are only reachable through nginx, which is what
+    # makes the load balancer the single entry point rather than a suggestion.
+    # Trading away direct :8001/:8002 access costs the ability to run
+    # multi_instance_demo.py from outside -- see the runbook for how to run it
+    # from *inside* the network instead, which is better anyway.
+    ports: !reset []
+
+  server-b:
+    ports: !reset []
+
+  client:
+    # Not published: nginx proxies to it as `client:80`. One public origin
+    # means no CORS, no second port in the security group, and a WebSocket URL
+    # that is same-origin with the page that opened it.
+    ports: !reset []
+    build:
+      context: ./client
+      args:
+        # Derived from ONE variable, so the box's .env sets the public hostname
+        # once and this follows. Getting it wrong is the most likely way to
+        # deploy a page that loads but never connects, so it should not be
+        # hand-written twice.
+        #
+        # Same origin and same port as the page itself, because nginx serves
+        # both. `ws://` (not `wss://`) because TLS is not configured by default
+        # -- see the runbook. If TLS is added this MUST become wss://, since
+        # browsers block ws:// from an https:// page as mixed content.
+        VITE_WS_URL: ws://${PUBLIC_HOST:?PUBLIC_HOST must be set in .env on the box}:${PUBLIC_PORT:-80}
+
+  lb:
+    build:
+      context: ./deploy
+      args:
+        # The production config: serves the client bundle at / and proxies
+        # /ws, /api, /healthz, /metrics to the two instances. See
+        # deploy/nginx.prod.conf.
+        NGINX_CONF: nginx.prod.conf
+        # Must match the `listen` in that config, or the image's healthcheck
+        # probes a port nothing is listening on and the container never goes
+        # healthy -- which would then block `lb` forever behind its own
+        # depends_on.
+        NGINX_PORT: "80"
+    # `!override` and not a plain list: the base file publishes 8080, and a
+    # plain list would MERGE with it -- leaving the box listening on both 80 and
+    # 8080. Caught by reading `docker compose config` rather than by trusting
+    # the overlay, which is the only way this class of bug gets caught.
+    #
+    # `!reset` cannot be used here because this key both removes the inherited
+    # value and supplies a new one; `!override` replaces the whole list.
+    ports: !override
+      # The only port published on the whole box.
+      #
+      # Bound to 0.0.0.0 because it must be reachable from the internet -- that
+      # is the point -- and the security group is what restricts *who* can
+      # reach it. PUBLIC_PORT exists so this same overlay can be tested locally
+      # on 8081 without binding a privileged port.
+      - "${PUBLIC_PORT:-80}:80"
+    depends_on:
+      # Also waits on the client now, since nginx proxies to it. Without this,
+      # nginx can start before `client` has a DNS entry and fail to resolve its
+      # upstream at boot.
+      client:
+        condition: service_healthy
