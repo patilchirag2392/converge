@@ -440,6 +440,34 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
 
 All six services should be `healthy`.
 
+### If a server container never goes healthy
+
+```
+dependency failed to start: container converge-server-a-1 is unhealthy
+```
+
+Check the reason before guessing:
+
+```bash
+dc logs server-a | grep -iE 'password|fatal|Traceback'
+```
+
+`asyncpg.exceptions.InvalidPasswordError` means the Postgres volume was
+initialised with a **different** password than the one now in `.env`. Postgres
+runs `initdb` — the step that creates the role — **only on a first, empty
+volume**. Changing `POSTGRES_PASSWORD` afterwards changes what the servers
+*send*, not what the database *expects*. Either put the original password back,
+or throw the volume away and start over:
+
+```bash
+dc down -v        # DELETES ALL DATA. Back up first if you care (section 9).
+dc up -d --build --wait
+```
+
+(The server fails fast here rather than retrying for 30 seconds, because a wrong
+password is a terminal error, not a transient one — see `TRANSIENT_CONNECT_ERRORS`
+in `server/app/db.py`.)
+
 ### If the build is killed
 
 ```
