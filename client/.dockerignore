@@ -1,0 +1,21 @@
+# Keep the build context small. node_modules is the big one: it is hundreds of
+# megabytes of host-platform binaries, and `npm ci` inside the builder recreates
+# it from package-lock.json anyway -- from the lock file, so it is *more*
+# reproducible than shipping the host's copy.
+node_modules/
+dist/
+dist-ssr/
+
+# Build output from a previous local `npm run build` would be copied in and then
+# overwritten, wasting context transfer and inviting stale-asset confusion.
+.vite/
+*.local
+
+# The Dockerfile passes VITE_WS_URL as a build ARG. A stray .env would silently
+# win over it and bake the wrong WebSocket URL into the bundle.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+.DS_Store
