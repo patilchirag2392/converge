@@ -36,6 +36,43 @@ from .store import OpStore, PostgresOpStore
 
 log = logging.getLogger("converge")
 
+# uvicorn configures its own loggers ("uvicorn", "uvicorn.access") and leaves
+# the root logger alone, so without this every `converge.*` log.info -- "connecting
+# to postgres", "schema applied", "bus started", "subscribed converge:ops:demo" --
+# is dropped on the floor. On a laptop that was survivable. In a container it is
+# not: `docker compose logs` is the only window into a startup-ordering problem,
+# and this stage is *about* startup ordering.
+#
+# Only ERROR was getting through before, via logging.lastResort. That is how the
+# Redis reconnect traceback was visible while none of the surrounding context was.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+
+
+DEFAULT_CONNECT_TIMEOUT = 30.0
+
+
+def connect_timeout() -> float:
+    """How long to keep retrying Postgres and Redis at startup, in seconds.
+
+    This is the app half of Stage 4's startup-ordering answer. compose's
+    healthchecks get the server started at roughly the right *time*; this makes
+    it not matter if they're wrong. 30s is comfortably longer than a cold
+    Postgres initdb and short enough that a genuinely missing database still
+    fails inside a normal patience window. Set CONVERGE_CONNECT_TIMEOUT=0 to
+    restore the old fail-immediately behaviour.
+    """
+    raw = os.environ.get("CONVERGE_CONNECT_TIMEOUT")
+    if raw is None:
+        return DEFAULT_CONNECT_TIMEOUT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        log.warning("ignoring unparseable CONVERGE_CONNECT_TIMEOUT=%r", raw)
+        return DEFAULT_CONNECT_TIMEOUT
+
 
 def default_instance_id() -> str:
     """Which process this is. Set INSTANCE_ID when running a cluster.
@@ -71,7 +108,10 @@ def create_app(
             yield
             return
 
-        pool = await create_pool()
+        # Retry rather than assume: whatever compose promised about ordering,
+        # this process is the one that has to survive being wrong about it.
+        wait = connect_timeout()
+        pool = await create_pool(wait=wait)
         await apply_schema(pool)
 
         # No REDIS_URL means single-instance mode: a NullBus, because there is
@@ -85,7 +125,7 @@ def create_app(
             live_bus = NullBus()
         else:
             redis_bus = RedisBus(url)
-            await redis_bus.start()
+            await redis_bus.start(wait=wait)
             live_bus = redis_bus
             log.info("instance %s on bus %s", instance, url)
 

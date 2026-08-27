@@ -156,8 +156,43 @@ class RedisBus:
     def on_message(self, handler: Handler) -> None:
         self._handler = handler
 
-    async def start(self) -> None:
-        await self._pubsub.subscribe(KEEPALIVE_CHANNEL)
+    async def start(self, wait: float = 0.0) -> None:
+        """Open the pubsub connection, retrying transient failures for `wait`
+        seconds.
+
+        Same shape and same reason as db.create_pool: under compose, Redis and
+        this process start together, so "not yet" is an expected answer for the
+        first second or two. Defaults to 0 so the test fixtures still skip
+        promptly when Redis is genuinely absent -- only main.py raises it.
+
+        redis-py's ConnectionError does not inherit from OSError, so it has to
+        be named explicitly. Imported here rather than at module scope for the
+        same reason as the Redis client above: nothing that avoids RedisBus
+        should need redis installed.
+        """
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        transient = (RedisConnectionError, RedisTimeoutError, OSError, asyncio.TimeoutError)
+        deadline = time.monotonic() + wait
+        delay = 0.25
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                await self._pubsub.subscribe(KEEPALIVE_CHANNEL)
+                break
+            except transient as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                log.warning(
+                    "redis not ready (attempt %d, %.0fs left): %s", attempt, remaining, exc
+                )
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, 2.0)
+
         self._reader = asyncio.create_task(self._read_loop(), name="converge-bus-reader")
         log.info("bus started")
 
