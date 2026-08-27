@@ -1,0 +1,181 @@
+# Converge -- the whole Stage 3 topology in one command.
+#
+#   docker compose up --build
+#
+#   client :5173 ─┐
+#                 ├─> lb :8080 (nginx, round-robin)
+#                 │      ├─> server-a :8000  (published on host :8001)
+#                 │      └─> server-b :8000  (published on host :8002)
+#                 │             ├─> postgres  (host :55432, tooling only)
+#                 │             └─> redis     (host :56379, tooling only)
+#
+# Nothing here is hardcoded that a deployment would need to change: every value
+# is ${VAR:-default}, so `docker compose up` works with no .env at all, and
+# .env.example documents what is worth overriding.
+#
+# Replaces scripts/cluster.sh. That script started processes and hoped; this
+# declares the graph and lets compose supervise it.
+
+name: converge
+
+# ---------------------------------------------------------------------------
+# Shared server configuration.
+#
+# The two instances are written out separately rather than as
+# `deploy: {replicas: 2}` on purpose. Replicas cannot have distinct
+# INSTANCE_IDs, and the whole Stage 3 demo depends on being able to see *which*
+# process a tab landed on -- "instance: a" in the UI pill is the observable
+# that makes cross-instance propagation testable at all. Anchors remove the
+# duplication without removing the identity.
+# ---------------------------------------------------------------------------
+x-server-env: &server-env
+  # Service names, not localhost. Each container has its own network
+  # namespace, so `localhost` inside server-a is server-a -- Postgres would be
+  # unreachable. Docker's embedded DNS resolves `postgres` and `redis` to the
+  # right containers on the compose network.
+  DATABASE_URL: postgresql://${POSTGRES_USER:-converge}:${POSTGRES_PASSWORD:-converge}@postgres:5432/${POSTGRES_DB:-converge}
+  # Setting REDIS_URL at all is what puts the app in clustered mode; unset
+  # means NullBus and no cross-instance propagation. See app/main.py.
+  REDIS_URL: redis://redis:6379
+  # The app's own patience, independent of the healthchecks below. See NOTES.md
+  # on why both exist.
+  CONVERGE_CONNECT_TIMEOUT: ${CONVERGE_CONNECT_TIMEOUT:-30}
+  # INFO so the startup sequence is visible in `docker compose logs`.
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-server: &server
+  build:
+    context: ./server
+  # One explicit tag shared by both services, so the image is built once and
+  # the second container reuses it. Without this, compose derives a name per
+  # service (converge-server-a, converge-server-b) and you end up storing two
+  # byte-identical images. It also states the actual design: the instances are
+  # the same artifact differing only by INSTANCE_ID.
+  image: converge-server:local
+  environment: *server-env
+  depends_on:
+    # `condition: service_healthy` -- NOT bare `depends_on`. A bare depends_on
+    # waits for the container to be *started*, which for Postgres is several
+    # seconds before it accepts connections. This waits for the healthcheck.
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------- data --
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-converge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-converge}
+      POSTGRES_DB: ${POSTGRES_DB:-converge}
+    volumes:
+      # Named volume, so `docker compose down` keeps the data and
+      # `docker compose down -v` is the deliberate way to throw it away. The
+      # Stage 2 restart demo needs the data to outlive the container.
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 55432, not 5432. The app does not need this published -- server-a and
+      # server-b reach Postgres over the compose network. It is published so
+      # *tooling* works from the host: psql, and the "straight from Postgres"
+      # step of scripts/multi_instance_demo.py.
+      #
+      # The non-default host port is the point. On 5432 this would either fail
+      # to bind or, worse, succeed while the Homebrew Postgres held the port --
+      # and then every host-side query would silently read the wrong database
+      # and report an empty document. A distinct port makes "which database am
+      # I talking to?" unambiguous.
+      - "${POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      # -h 127.0.0.1 forces TCP, and that detail matters. The postgres image
+      # runs an internal server during initdb with listen_addresses='', so a
+      # socket-based pg_isready reports READY while the database is still
+      # initialising and about to be shut down and restarted. Over TCP that
+      # phase is correctly not-ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-converge} -d ${POSTGRES_DB:-converge}"]
+      interval: 2s
+      timeout: 3s
+      # 30 x 2s = a minute of grace for a cold initdb on first boot.
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Persistence off, matching scripts/cluster.sh -- and matching the Stage 3
+    # decision that Redis is a latency layer over the durable log, never a
+    # second source of truth. Nothing here is worth surviving a restart, and
+    # saying so in the command is cheaper than explaining it later. There is
+    # deliberately no volume for the same reason.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      # 56379 for the same reason as Postgres above: `redis-cli -p 56379
+      # monitor` is the fastest way to watch ops cross the bus, and a distinct
+      # port means you cannot accidentally be watching the Homebrew Redis.
+      - "${REDIS_PORT:-56379}:6379"
+    healthcheck:
+      # A Redis that is loading a dataset answers PING with an error, so
+      # grepping for PONG is stricter than trusting the exit code alone.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- servers --
+  server-a:
+    <<: *server
+    environment:
+      <<: *server-env
+      INSTANCE_ID: a
+    # Published so the existing demo scripts still work unchanged --
+    # multi_instance_demo.py and latency_probe.py ask instances directly on
+    # 8001/8002 precisely to show they hold separate replicas.
+    ports:
+      - "${SERVER_A_PORT:-8001}:8000"
+
+  server-b:
+    <<: *server
+    environment:
+      <<: *server-env
+      INSTANCE_ID: b
+    ports:
+      - "${SERVER_B_PORT:-8002}:8000"
+
+  # ---------------------------------------------------------- load balancer --
+  lb:
+    build:
+      context: ./deploy
+    ports:
+      - "${LB_PORT:-8080}:8080"
+    depends_on:
+      # Also service_healthy, for a second reason: nginx resolves the names in
+      # its upstream block once, at startup, and exits if one does not resolve.
+      # Waiting for both instances means the DNS entries exist by then.
+      server-a:
+        condition: service_healthy
+      server-b:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- client --
+  client:
+    build:
+      context: ./client
+      args:
+        # Build-time, not runtime: Vite inlines VITE_* into the bundle, so this
+        # cannot be an `environment:` entry. Changing it requires a rebuild --
+        # the tradeoff is written up in NOTES.md.
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:${LB_PORT:-8080}}
+    ports:
+      - "${CLIENT_PORT:-5173}:80"
+    # No depends_on: the page should load and show "disconnected" if the
+    # backend is down, which is more honest than refusing to start. The client
+    # reconnects on its own.
+    restart: unless-stopped
+
+volumes:
+  pgdata:
