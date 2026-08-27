@@ -12,6 +12,21 @@ Build plan and learning gates: [ROADMAP.md](./ROADMAP.md).
 
 ## Status
 
+**Stage 4 — containerized, with CI.** The whole Stage 3 topology now comes up
+with one command, and every push runs both test suites plus a real stack.
+
+- [x] A Dockerfile per service, multi-stage (server, client, load balancer)
+- [x] `docker compose up` brings up 2 instances + Nginx + Postgres + Redis
+- [x] Startup ordering handled with healthchecks *and* retry-on-connect
+- [x] GitHub Actions: both suites, real service containers, images build
+
+```bash
+docker compose up --build          # that's the whole thing
+```
+
+Then <http://localhost:5173/?doc=demo> in two tabs. See
+[Running it in Docker](#running-it-in-docker).
+
 **Stage 3 — horizontal scaling with Redis pub/sub.** Multiple server instances
 behind an nginx load balancer. Each instance holds its own WebSocket connections
 and its own CRDT replica; Redis carries operations between them so a client on one
@@ -41,7 +56,11 @@ Build notes and the decisions behind each stage: [NOTES.md](./NOTES.md).
 ## Run it
 
 Three things: Postgres 14+, Python 3.11+ (via [uv](https://docs.astral.sh/uv/)),
-Node 20+.
+Node 20+. Or none of them —
+[`docker compose up --build`](#running-it-in-docker) needs only Docker.
+
+The rest of this section runs the stack as host processes, which stays the
+fastest loop for working on the code (`--reload`, real debuggers, no rebuild).
 
 ```bash
 # one-time
@@ -155,6 +174,114 @@ on any rebalance or restart. Round-robin is deliberate so the real requirement
 stays visible.
 
 ---
+
+## Running it in Docker
+
+One command, from a clean checkout. Nothing needs to be installed but Docker.
+
+```bash
+docker compose up --build
+```
+
+That brings up six containers and waits for them to be healthy:
+
+| service | host port | what it is |
+|---|---|---|
+| `client` | 5173 | the built Vite bundle, served by nginx |
+| `lb` | 8080 | nginx, round-robin across the two instances |
+| `server-a` | 8001 | FastAPI instance `a` |
+| `server-b` | 8002 | FastAPI instance `b` |
+| `postgres` | 55432 | the durable operation log |
+| `redis` | 56379 | the pub/sub bus |
+
+Open <http://localhost:5173/?doc=demo> in two tabs and check the `instance:`
+pill — round-robin usually lands them on **different** processes. Type in one and
+it appears in the other, having crossed through Redis. That is the Stage 3
+behaviour, containerized.
+
+Postgres and Redis are published on **non-default** ports on purpose: they aren't
+needed from the host (the servers reach them over the compose network), and
+5432/6379 are usually taken by a local Homebrew install. A distinct port means a
+host-side query can't silently hit the wrong database.
+
+```bash
+docker compose ps                       # what's up, and healthy?
+docker compose logs -f server-a         # the startup sequence, then edits
+docker compose down                     # stop, keep the data
+docker compose down -v                  # stop and drop the volume
+```
+
+Useful checks against the running stack:
+
+```bash
+curl localhost:8080/healthz             # alternates a, b, a, b...
+docker compose exec postgres psql -U converge -d converge
+docker compose exec redis redis-cli monitor      # watch ops cross the bus
+
+cd server
+DATABASE_URL=postgresql://converge:converge@localhost:55432/converge \
+  uv run python scripts/multi_instance_demo.py   # exits 1 if it doesn't propagate
+uv run python scripts/latency_probe.py 60
+```
+
+`scripts/cluster.sh` still works and is still the way to run the stack as bare
+host processes; compose replaces it for anything else.
+
+### Configuration
+
+Everything is an environment variable with a working default, so `docker compose
+up` needs no `.env` at all. [`.env.example`](./.env.example) documents the
+overrides — `cp .env.example .env` and edit. `.env` is gitignored.
+
+The one exception is `VITE_WS_URL`, which is a **build** argument rather than a
+runtime variable: Vite inlines `import.meta.env.VITE_*` into the bundle, so
+there's nothing left to configure at runtime. Changing it needs
+`docker compose build client`. The tradeoff, and the runtime-injection
+alternative, are in [NOTES.md](./NOTES.md).
+
+### Does `depends_on` wait for Postgres?
+
+**No — not on its own.** Bare `depends_on` waits for the container to be
+*started*, which is several seconds before Postgres accepts connections; it has
+to run `initdb`, create the role and database, then restart. A server released at
+"started" races the database.
+
+`depends_on: {condition: service_healthy}` does wait, and that's what this
+compose file uses — but it still isn't enough, so the app **also** retries on
+connect (30s, exponential backoff, `CONVERGE_CONNECT_TIMEOUT`). Both, on purpose:
+
+- healthchecks make the common case fast and keep the logs clean
+- the retry loop is the half that's actually *correct* — it survives Postgres
+  restarting later, and it still exists on ECS, where `depends_on` doesn't
+
+One detail worth knowing: the obvious healthcheck is wrong. The postgres image
+runs an internal server during `initdb` with `listen_addresses=''`, so a
+socket-based `pg_isready` reports **ready** while the database is still
+initialising. This compose file forces TCP with `pg_isready -h 127.0.0.1`. Full
+reasoning in [NOTES.md](./NOTES.md).
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — three parallel jobs on
+every push and PR:
+
+| job | runs |
+|---|---|
+| `server tests` | pytest against **real** Postgres and Redis service containers |
+| `client tests` | vitest |
+| `images build + stack runs` | all three images build, then the whole stack comes up and syncs |
+
+Two things it does that are easy to get wrong:
+
+- **`CONVERGE_REQUIRE_SERVICES=1`.** The suite skips its database tests when
+  Postgres or Redis is unreachable — right on a laptop, dangerous in CI, where a
+  misconfigured service container would report `96 passed, 7 skipped` and go
+  green without ever touching a database. The flag turns those skips into hard
+  failures.
+- **The Docker job runs the stack, not just `build`.** `compose up --wait` exits
+  non-zero if anything never reports healthy, then the job asserts the balancer
+  reaches two distinct instances and that an edit crosses between them. A
+  compose file that builds and then deadlocks on startup order would fail here.
 
 ## Architecture
 
@@ -524,8 +651,34 @@ Being able to state these is worth more than hiding them.
 - **`/metrics` uses wall clocks on two machines.** Meaningful on one host,
   unreliable across hosts. `scripts/latency_probe.py` is the trustworthy
   measurement because it uses a single clock.
+- **A Redis restart reports a false error, and loses one op cross-instance.**
+  The ordering is persist → apply → broadcast locally → publish. If the publish
+  raises — which it does on the first edit after Redis is replaced — the whole
+  frame is treated as failed and the client is told
+  `"could not persist operations"`. That message is **wrong**: the operations
+  *were* persisted and local clients *did* get them; only the cross-instance
+  publish failed. So the edit is safe but reported as lost, the other instance
+  never sees it, and the next edit works fine. Two defects — no publish retry,
+  and one exception handler covering two failure modes with opposite
+  consequences. Reproduces deterministically with
+  `docker compose up -d --force-recreate redis`; full repro and diagnosis in
+  [NOTES.md](./NOTES.md). Does **not** affect `docker compose up` from a clean
+  state.
+- **nginx caches upstream DNS at startup.** It resolves `server-a`/`server-b`
+  once, so `docker compose up --force-recreate server-a` gives that container a
+  new IP the load balancer never learns, and it proxies into a black hole until
+  `lb` is restarted too. Accepted at two instances; the fixes (a `resolver` plus
+  a variable in `proxy_pass`, or real service discovery) cost more than the
+  problem.
+- **`VITE_WS_URL` is baked into the client image at build time**, because Vite
+  inlines `import.meta.env.VITE_*` — so the client image is environment-specific
+  and changing the URL needs a rebuild, not a restart. Will need runtime
+  injection (an entrypoint writing a `config.js` the app reads) before Stage 5
+  deploys it under a real hostname.
 - **Cluster orchestration is a shell script.** No supervision, no restart-on-crash,
-  and `down` pattern-matches stray processes. Stage 4's Docker Compose replaces it.
+  and `down` pattern-matches stray processes. `docker-compose.yml` replaces it
+  for everything except running the stack as bare host processes, which
+  `scripts/cluster.sh` is still the fastest way to do.
 - **Lone UTF-16 surrogates can't be persisted.** Python's `len()` says one
   character so the CRDT accepts one, but it can't be encoded as UTF-8 and the write
   fails (rolling the frame back correctly). Reaching it requires an edit *inside* an
@@ -580,6 +733,22 @@ right thing to put on a weak channel, why persistence happens before publishing,
 how the self-echo loop is prevented, and what the measured latency figure does and
 doesn't include.
 
+**Stage 4 — Docker and CI.** Explain what each Dockerfile does line by line, and
+what the pipeline runs. The load-bearing parts:
+
+1. **What each build stage is for, and why the final image is slim.** The real
+   answer is not `--no-dev` — it's that layers are *additive*, so a file added
+   and later deleted is still shipped. Multi-stage works because the final stage
+   starts clean and only receives what a `COPY --from` names. The measured proof
+   is in NOTES.md: a single-stage image that genuinely deletes `uv` is still
+   51 MB bigger than the multi-stage one.
+2. **Does `depends_on` wait for Postgres to accept connections?** No. Be able to
+   say why healthchecks alone are still insufficient — a healthcheck can lie
+   during `initdb`, healthy at t=0 says nothing about t=1, and `depends_on`
+   doesn't exist outside compose — and therefore why the app retries too.
+3. **Why the pipeline sets `CONVERGE_REQUIRE_SERVICES`.** Because a suite that
+   skips its integration tests goes green without testing anything.
+
 **Stage 2 — persistence.** Explain the schema and why it stores what it stores, in
 that shape. The load-bearing parts: why the primary key is the operation's identity
 (idempotency for free), why an operation log rather than materialized state (for
@@ -589,11 +758,18 @@ doesn't matter, and why writes happen before broadcasts.
 ## Layout
 
 ```
-NOTES.md                   per-file build notes and decisions for Stage 2
+NOTES.md                   per-file build notes and decisions, Stages 2-4
+docker-compose.yml         the whole topology: 2 instances + nginx + Postgres + Redis
+.env.example               every configurable value, with its default
+.github/workflows/ci.yml   tests + image builds + a live stack, on every push
 shared/crdt-vectors.json   cases both test suites assert, pinning the two implementations
-deploy/nginx.conf          load balancer: round-robin, WebSocket upgrade headers
-scripts/cluster.sh         two instances + nginx (+ Redis), up / down / status
+deploy/Dockerfile          load balancer image: stock nginx + one config file
+deploy/nginx.docker.conf   load balancer config for compose (upstreams by service name)
+deploy/nginx.conf          load balancer config for host processes (upstreams on ports)
+scripts/cluster.sh         two instances + nginx (+ Redis) as host processes
 server/
+  Dockerfile               multi-stage: uv builds the venv, runtime carries only it
+  .dockerignore            keeps .venv, tests and caches out of the build context
   app/crdt.py              the CRDT: ids, insert-after, sibling order, tombstones, buffering
   app/bus.py               Redis pub/sub: the envelope, per-document channels, the reader
   app/schema.sql           the two tables, the constraints, the index
@@ -611,6 +787,9 @@ server/
   tests/test_cluster.py    15 cross-instance tests on an in-process bus
   tests/test_redis_bus.py  7 integration tests against real Redis
 client/
+  Dockerfile               multi-stage: Node builds the bundle, nginx serves it
+  nginx.conf               static serving, asset caching, SPA fallback
+  .dockerignore            keeps node_modules and dist out of the build context
   src/crdt.ts              mirror of crdt.py
   src/diff.ts              <textarea> value -> operations
   src/useDocSocket.ts      socket, caret anchoring, offline outbox, reconnect replay

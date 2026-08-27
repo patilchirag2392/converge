@@ -6,7 +6,13 @@ the offline-typing survival, the cross-instance propagation.
 
 Deliberately **not** part of `npm test`: they need a running server, a database,
 and a real browser, so they're a manual verification tool rather than unit tests.
-Stage 4's CI could run them in a container if that seems worth it.
+
+CI does **not** run these. It runs `scripts/multi_instance_demo.py` against the
+compose stack instead — same claim (an edit crosses instances), asserted with a
+WebSocket client rather than a browser, and no Playwright download on the runner.
+Putting these in CI would need a browser image and would trade several minutes
+per run for coverage of the React layer that vitest already covers. Worth
+revisiting if a rendering bug ever ships.
 
 ## Setup
 
@@ -26,7 +32,7 @@ The Chromium path defaults to this machine's Playwright cache; override with
 |---|---|---|
 | `two_tabs_stage1.mjs` | single instance on :8000, client on :5173 | concurrent edits merge; caret holds at 2 on a remote append and shifts 2→5 when the insert is before it |
 | `pull_the_plug.mjs` | single instance + Postgres | kills the server mid-session, types while it's down (`queued: n`), restarts, and confirms the offline keystrokes reach Postgres and survive a second restart |
-| `two_instances_browser.mjs` | `scripts/cluster.sh up` with `REDIS_URL`, client on `VITE_WS_URL=ws://localhost:8080` | forces two tabs onto *different* instances, then checks edits cross both ways and all four replicas agree |
+| `two_instances_browser.mjs` | `scripts/cluster.sh up` with `REDIS_URL`, client on `VITE_WS_URL=ws://localhost:8080` — **or just `docker compose up`**, which serves the client on :5173 and the balancer on :8080 already | forces two tabs onto *different* instances, then checks edits cross both ways and all four replicas agree |
 
 ```bash
 node two_tabs_stage1.mjs
@@ -45,5 +51,9 @@ One per stage, kept as visual evidence of the progression:
 - `stage1-tab-a.png` — CRDT merging, cursor preserved
 - `stage2-after-restart.png` — text recovered from Postgres after a restart
 - `stage3-tab-a.png` — the `instance:` pill, showing which process the tab hit
+- `stage4-containerized.png` — the same two-instance behaviour, but every part of
+  the stack (client, balancer, both servers, Postgres, Redis) in a container.
+  Taken from a `two_instances_browser.mjs` run against `docker compose up`.
+  The `clients: 1` pill is the known per-instance presence bug, still visible.
 
 Useful for a portfolio README later; harmless to delete if not.
