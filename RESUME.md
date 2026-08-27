@@ -1,7 +1,7 @@
 # Resume here
 
-Session handoff for Converge. Written 2026-08-25, updated 2026-08-26 after
-Stage 4. Paste this file (or point at it) to bring a fresh session up to speed.
+Session handoff for Converge. Written 2026-08-25, updated 2026-08-27 after
+Stage 5. Paste this file (or point at it) to bring a fresh session up to speed.
 
 Companion docs: [ROADMAP.md](./ROADMAP.md) is the plan, [NOTES.md](./NOTES.md) is
 the per-file decision trail for Stages 2–4, [README.md](./README.md) is how it all
@@ -11,7 +11,8 @@ works.
 
 ## Where things stand
 
-**Stages 0–4 are built and verified. Stage 5 (AWS) is next and untouched.**
+**Stages 0–4 are built, verified and green in CI. Stage 5's deployment config
+is written and locally verified; nothing has been provisioned on AWS.**
 
 | Stage | What | State |
 |---|---|---|
@@ -19,8 +20,8 @@ works.
 | 1 | hand-written RGA CRDT | done, **not tagged, not merged** |
 | 2 | Postgres persistence (op log) | done, **not tagged, not merged** |
 | 3 | Redis pub/sub across 2 instances | done and pushed, **not tagged, not merged** |
-| 4 | Docker + GitHub Actions | done, **not pushed** — so CI has never run |
-| 5 | Deploy to AWS | not started |
+| 4 | Docker + GitHub Actions | done, pushed, **CI green**, tagged `stage-4` |
+| 5 | Deploy to AWS | config + runbook done; **nothing provisioned yet** |
 
 Tests: **103 server** (`cd server && uv run pytest`), **43 client**
 (`cd client && npm test`). Every commit on `stage-3-redis` passes independently —
@@ -33,23 +34,29 @@ main              e801044   Stage 0 only (+ one demo fix)      [pushed]
 stage-1-crdt      f433c0a   Stage 1                            [pushed]
 stage-2-postgres  f0a0955   Stage 1 + 2                        [pushed]
 stage-3-redis     cf6a626   Stage 1 + 2 + 3                    [pushed]
-stage-4-docker-ci (tip)     Stage 1 + 2 + 3 + 4 ← current      [NOT pushed]
-tags              stage-0                                      [pushed]
+stage-4-docker-ci bbbbfc6   Stage 1 + 2 + 3 + 4                [pushed, CI green]
+stage-5-aws       (tip)     Stage 1 + 2 + 3 + 4 + 5 ← current  [NOT pushed]
+tags              stage-0, stage-4                             [pushed]
 ```
 
-**`stage-4-docker-ci` has never been pushed, which means the GitHub Actions
-workflow has never run.** That is the single biggest open item: the workflow is
-desk-checked and every step was verified by hand against the local stack, but
-"goes green" is unproven. Pushing the branch is what proves it.
+**CI is green on `stage-4-docker-ci`** (run 33083297367): 103 server tests with
+**zero skips**, 43 client tests, all three images built, the stack came up and an
+edit crossed instances in 8.1 ms. One fix was needed after the first push —
+`astral-sh/setup-uv@v10` does not resolve, because that action publishes moving
+major aliases only up to v7; it is pinned to `v10.0.1` now.
+
+**`stage-5-aws` is not pushed, and that blocks deploying**: `bootstrap.sh`
+clones the branch from GitHub, so the box has nothing to build until it's
+pushed. The runbook says this in its prerequisites.
 
 **Nothing has been merged to `main` since Stage 0.** Each stage branch builds on
-the previous one, so `stage-4-docker-ci` carries all four stages' work, well
-ahead of `origin/main`. The branch names no longer line up with what's in each.
-Four branches are on GitHub; `stage-4-docker-ci` is local only.
+the previous one, so `stage-5-aws` carries all five stages' work, well ahead of
+`origin/main`. The branch names no longer line up with what's in each. Five
+branches are on GitHub; `stage-5-aws` is local only.
 
 That's a deliberate consequence of the roadmap's rule ("merge when the stage's
 learn-gate passes") plus the fact that **no learn-gate has been done for Stages
-1, 2, 3 or 4**. Decide whether to keep gating or catch up — see loose ends below.
+1–5**. Decide whether to keep gating or catch up — see loose ends below.
 
 ---
 
@@ -135,7 +142,8 @@ as visual evidence of the progression.
 
 ## Loose ends, roughly in priority order
 
-1. **No learn-gate done for Stages 1, 2, 3 or 4**, and no `stage-1`…`stage-4` tags. The roadmap gates merging on being able to explain the stage
+1. **No learn-gate done for Stages 1, 2, 3 or 5**, and no `stage-1`/`stage-2`/`stage-3`/`stage-5` tags
+   (`stage-4` is tagged). The roadmap gates merging on being able to explain the stage
    without looking. Either do the gates and merge+tag each, or decide to catch up
    in one go. The questions are in the README under *Learn-gates*.
 2. **`main` is three stages behind.** The longer this drifts, the less the history
@@ -144,23 +152,32 @@ as visual evidence of the progression.
    pill counts only sockets on the instance you're connected to, so two tabs on
    different instances each show `clients: 1`. Visibly wrong. Needs presence in
    Redis with its own expiry/liveness design.
-4. **The CI workflow has never run.** `stage-4-docker-ci` isn't pushed. Every
-   step was verified by hand locally — pytest under `CONVERGE_REQUIRE_SERVICES=1`,
-   the round-robin shell snippet verbatim, `compose build`, `compose up --wait`,
-   the demo — but GitHub Actions can't be run locally, so the workflow as a whole
-   is unproven. Push the branch and watch it.
-5. **A Redis restart reports a false error** (found during Stage 4, filed not
+4. **Stage 5 has never touched AWS.** The deployment config is verified locally
+   (prod overlay, one open port, browser tabs syncing through the production
+   nginx) but every `aws` command in `deploy/aws/README.md` is desk-checked, not
+   run. Unknowns that only a real account resolves: whether the Canonical AMI
+   SSM parameter path still works, whether the free tier applies to this
+   account, and whether a `t3.micro` really survives the client image build with
+   2 GiB of swap. Do a budget alarm first, then work through the runbook.
+5. **`stage-5-aws` isn't pushed, which blocks the deploy.** `bootstrap.sh`
+   clones the branch on the box; until it's on the remote the instance boots
+   with no application and the error is buried in
+   `/var/log/cloud-init-output.log`.
+6. **A Redis restart reports a false error** (found during Stage 4, filed not
    fixed). The first edit after Redis is replaced gets
    `"could not persist operations"` — which is untrue: the ops *are* in Postgres
    and local clients *did* see them; only the cross-instance publish failed. Two
    defects: no publish retry on the bus, and one exception handler covering two
    failure modes with opposite consequences. Deterministic repro and full
    diagnosis in NOTES.md. Doesn't affect a clean-state `compose up`.
-6. **`VITE_WS_URL` is baked into the client image at build time** (Vite inlines
-   `import.meta.env.VITE_*`), so the client image is environment-specific. This
-   needs solving *before* Stage 5 puts it behind a real hostname — runtime
-   injection via an entrypoint that writes a `config.js` the app reads.
-7. **`scripts/cluster.sh` survives on purpose.** compose replaced it for
+7. **`VITE_WS_URL` is still baked into the client image at build time.** Stage 5
+   works around it rather than fixing it: the image is built *on the box* from
+   the box's `.env`, so one variable (`PUBLIC_HOST`) drives it. The cost is real
+   though — a stop/start changes the EC2 hostname, and recovering means editing
+   `.env` and **rebuilding**, not restarting. An Elastic IP avoids it. The
+   actual fix is runtime injection: an entrypoint writing a `config.js` the app
+   reads.
+8. **`scripts/cluster.sh` survives on purpose.** compose replaced it for
    everything except running the stack as bare host processes, which is still
    the fastest loop for code changes. It's still a shell script with no
    supervision and a `down` that pattern-matches strays.
@@ -224,6 +241,28 @@ clean and receives only what a `COPY --from` names. Measured numbers in NOTES.md
 
 **Stage 4 — two explicit server services, not `deploy: replicas: 2`.** Replicas
 can't have distinct `INSTANCE_ID`s, and without those the stage is unobservable.
+
+**Stage 5 — one EC2 box, and the ports closed twice.** The security group is one
+layer; `docker-compose.prod.yml` not publishing the ports is the other. Both,
+because a published container port doesn't respect the host firewall the way
+you'd expect — Docker writes its own iptables DNAT rules — so "the security
+group will catch it" is a habit worth not forming. 443 is deliberately **closed**:
+nothing is listening on it, and an open port with no service is surface with no
+function.
+
+**Stage 5 — compose MERGES `ports` across `-f` files.** An overlay that just
+doesn't mention `ports` leaves Postgres published to the internet. It takes
+`!reset []`, or `!override [...]` where a service both drops the inherited value
+and adds one. Needs Compose v2.24+, which `bootstrap.sh` checks rather than
+assumes.
+
+**Stage 5 — no RDS, knowingly.** The data lives in a Docker volume on the
+instance's root EBS volume, so terminate destroys it (stop doesn't). What that
+gives up: backups/PITR, a data lifecycle independent of compute, multi-AZ
+failover. Why it's still right: the failure this project explores is CRDT
+convergence, which one Postgres exercises identically, and RDS would more than
+double the bill. The line that matters: *with real users, RDS would come before
+any further scaling work.*
 
 ### The measured number (real, one clock, no skew)
 

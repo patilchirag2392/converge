@@ -877,3 +877,325 @@ its own tests rather than being smuggled into the containerization stage. Filed,
 with a repro, rather than hidden. Note it does **not** affect
 `docker compose up` from a clean state, where Redis is healthy before either
 server connects.
+
+# Stage 5 — deploy to AWS, one EC2 box · build notes
+
+Interview-prep breadcrumbs, written as I build. Terse on purpose.
+
+**Scope honesty up front:** the deployment *config* is verified, the AWS
+*resources* are not. The production overlay was built and exercised locally —
+including two real browser tabs syncing across instances through the production
+Nginx on a single port — but no AWS account was touched from this session, by
+request. Every `aws` command in the runbook is desk-checked against the API, not
+executed. That distinction is stated in the runbook too, because a runbook that
+implies it was run when it wasn't is worse than one that admits it.
+
+---
+
+## The decision: security groups, and why the app closes the ports too
+
+**What is open, to whom, and why:**
+
+| Port | To | Why |
+|---|---|---|
+| 80/tcp | `0.0.0.0/0` | The whole application. Nginx serves the bundle *and* proxies the API here. |
+| 22/tcp | `<my-ip>/32` | Administration only. No user needs it. |
+| 443/tcp | **nobody** | TLS isn't configured, so opening it would be surface with nothing behind it. |
+| 5432 (Postgres) | **nobody** | Every operation in every document. |
+| 6379 (Redis) | **nobody** | **No auth configured** — public Redis is RCE, not just data exposure. |
+| 8000 ×2 (instances) | **nobody** | Closing them makes Nginx the only entry point rather than a suggestion. |
+| 80 (client container) | **nobody** | Nginx proxies to it; publishing would be a second origin for the same files. |
+
+The interesting decision is **443 being closed**. It was tempting to open it
+because "HTTP/HTTPS" is the reflexive answer, but nothing is listening on it. An
+open port with no service is a permanent invitation to scanners for zero
+function. It gets opened in the same change that configures a certificate.
+
+**And the ports are closed twice, in two different systems.** The security group
+is one layer; `docker-compose.prod.yml` not publishing them is the other. That
+is not belt-and-braces for its own sake — it is because **a published container
+port does not respect the host firewall the way you would expect.** Docker writes
+its own `iptables` DNAT rules in the `nat` table, which bypass a good deal of
+what you might have configured on the host. So "the security group will catch
+it" is a habit worth not forming; the port should not be published in the first
+place.
+
+**The trap that made this concrete, and it is a good one:** Compose *merges* the
+`ports` list across `-f` files rather than replacing it. A production overlay
+written the obvious way — simply not mentioning `ports` — **inherits the base
+file's and leaves Postgres published on 55432 to the entire internet.** Verified
+rather than assumed, before writing a line of the overlay:
+
+```
+$ docker compose -f base.yml -f overlay-without-ports.yml config | grep published
+        published: "55432"          # still there
+```
+
+It takes `ports: !reset []` to actually remove it, and `!override [...]` where a
+service both drops the inherited value and supplies a new one (`lb`, which would
+otherwise publish 80 *and* 8080). Checked the result the same way:
+
+```
+$ ... config    ->  TOTAL published ports on the box: 1
+```
+
+**Tradeoff:** closing `:8001`/`:8002` costs the ability to run
+`multi_instance_demo.py` and `latency_probe.py` against the box from outside,
+because both ask instances directly on those ports — which is precisely the
+capability that shouldn't be public. Hence `verify_deployment.py`, which asserts
+the same properties through the one public origin. That is a strictly better
+test anyway: it exercises the path a browser actually takes.
+
+---
+
+## The decision: single-box durability, and what RDS would buy
+
+**Where the data is:** Postgres writes to the Docker named volume `pgdata`,
+which is a directory on the instance's **root EBS volume**. There is no other
+copy. So the durability boundary is one EBS volume in one availability zone.
+
+| Action | EBS volume | Data | Billing |
+|---|---|---|---|
+| `compose down` | intact | **safe** (named volume outlives containers) | unchanged |
+| `compose down -v` | intact | **gone** | unchanged |
+| **stop** instance | **intact** | **safe** | instance-hours stop, EBS keeps billing |
+| **reboot** | intact | **safe** | unchanged |
+| **terminate** instance | **deleted** | **gone, unrecoverably** | everything stops |
+
+**Stop is safe, terminate is destructive, and they are adjacent buttons in the
+console.** `DeleteOnTermination=true` is the default for a root volume; the
+runbook sets it explicitly in `run-instances` so it is a decision on the page
+rather than a surprise later.
+
+Second-order consequence that is easy to miss: **stopping changes the public DNS
+name**, so the data survives but the client bundle has a stale hostname baked in
+and must be rebuilt. An Elastic IP avoids it — and introduces its own cost trap,
+below.
+
+**What not using RDS actually gives up** — the honest list, not a strawman:
+
+- automated backups and point-in-time recovery. Here: nothing until you run
+  `pg_dump` yourself.
+- **data lifecycle independent of compute.** This is the big one. With RDS you
+  can terminate the app server and the database is untouched. Here, the compute
+  and the data share a lifecycle, so the destructive operation on the *server* is
+  also the destructive operation on the *database*.
+- multi-AZ standby and automatic failover. Here: one AZ.
+- managed patching, storage that grows independently, query insights.
+
+**Why it is still the right call here:** the failure this project exists to
+explore is CRDT convergence across instances, and a single Postgres exercises
+that identically. `db.t4g.micro` is ~$12–15/month plus storage once free tier
+lapses, which more than doubles the bill. The defensible interview line is the
+ordering, though: *if this had real users, RDS (or at minimum a snapshot
+schedule) would come before any further scaling work*, because "we lose
+everything if the box dies" is a worse property than "we can only run two
+instances".
+
+**Tradeoff, stated plainly:** this deployment is a demo that can be destroyed by
+one wrong click, and the mitigation is a documented `pg_dump` rather than
+infrastructure. Accepted for a portfolio project; would not be accepted for
+anything with a user.
+
+---
+
+## Cost, and the traps
+
+`t3.micro` + 20 GiB gp3 + one public IPv4, us-east-1, 24/7:
+
+| | rate | ×730 h |
+|---|---|---|
+| t3.micro | $0.0104/hr | $7.59 |
+| 20 GiB gp3 | $0.08/GB-mo | $1.60 |
+| public IPv4 | $0.005/hr | $3.65 |
+| transfer out | 100 GB/mo free | $0.00 |
+| | | **≈ $12.84/mo** |
+
+Free tier covers all three billable lines (750 h instance, 30 GB EBS, 750 h
+IPv4) → ≈ $0. **But** AWS moved new accounts to a credit-based free plan in
+mid-2025, so which model applies depends on the account's age — the runbook says
+to check rather than guessing on the reader's behalf. Prices are quoted with the
+region and a "verify at the pricing page" caveat, because quoting stale AWS
+prices with confidence is its own failure mode.
+
+**The three cost traps, all documented:**
+
+1. **Stopping ≠ free.** Instance-hours stop; EBS keeps billing, because the data
+   is still there. Only terminating takes it to zero.
+2. **An Elastic IP is free while attached to a *running* instance** and billed
+   the moment it isn't — so it starts costing money at the exact instant you
+   stop or terminate, which is when you have stopped paying attention. The
+   single most common way to keep paying AWS after you think you're done.
+3. **Region drift.** The console shows one region at a time, so an instance in
+   the wrong region is invisible. `teardown.sh` ends with an all-regions sweep.
+
+Budget alarm comes *before* provisioning in the runbook, deliberately. Also
+stated: AWS has **no hard spending cap** — a budget alert is a notification, not
+a limit. It buys you the chance to run teardown; it doesn't run it.
+
+---
+
+## Files
+
+### `docker-compose.prod.yml`
+An overlay, not a replacement. Changes exactly three things: closes every
+published port but the edge, puts Nginx on 80 with the production config, and
+refuses to start on a default password.
+- **An overlay, because the topology, healthchecks and startup ordering are
+  already right in the base file** and duplicating them would let the two drift.
+- **`POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?...}`** — compose's `:?` makes a
+  missing value a startup *failure*. The base file defaults it to `converge` for
+  local dev; on a public box a forgotten password must not silently become a
+  default credential. Same for `PUBLIC_HOST`. Both verified by running `config`
+  with the variables unset and confirming it errors.
+- **`VITE_WS_URL` derived from one variable** (`ws://${PUBLIC_HOST}:${PUBLIC_PORT}`)
+  rather than written by hand, because getting it wrong is the most likely way to
+  deploy a page that loads but never connects.
+- **Tradeoff:** `!reset`/`!override` need Compose v2.24+. Silently ignored on
+  older versions, which would leave the database published — so `bootstrap.sh`
+  *checks the version and refuses to continue*, rather than trusting it.
+
+### `deploy/nginx.prod.conf`
+The public edge. Same upstreams as the local config; different job — it serves
+the client bundle *and* proxies the API, so one port is enough.
+- **One origin has three consequences, and they are the reason for the design:**
+  one open port instead of four; no CORS, because page and socket share scheme,
+  host and port; and a WebSocket URL derivable from the page URL.
+- **`location /ws/` carries the upgrade handling**, and longest-prefix matching
+  means it wins over `location /` regardless of file order. `proxy_read_timeout
+  1h` matters more here than locally — a demo tab idle on another continent is
+  exactly the case the default 60s would kill.
+- **`/metrics` is deliberately public**, and the comment says so: it exposes
+  propagation latency and a document count, no document text. Being able to show
+  it from a browser is the point. If it ever carried anything sensitive the
+  answer is `allow`/`deny`, not hoping nobody guesses the path.
+- **Tradeoff:** static files now take an extra hop (edge Nginx → client Nginx)
+  instead of being served directly. Measured cost is negligible on a loopback
+  bridge, and it keeps one image responsible for the frontend rather than
+  copying the bundle into two.
+
+### `deploy/Dockerfile` (changed)
+Gains `ARG NGINX_CONF` and `ARG NGINX_PORT`, so one image definition produces
+either the local load balancer or the public edge.
+- **A build ARG rather than a second Dockerfile**, because everything else is
+  identical and a copy would drift. Rather than a bind mount, because the image
+  stays self-contained and therefore deployable to a host with no copy of the repo.
+- **`NGINX_PORT` has to exist as an `ENV` too**: a `HEALTHCHECK` cannot reference
+  a build ARG, but its shell form expands environment variables at run time.
+  Without it the prod image would probe :8080, never go healthy, and deadlock
+  `lb` behind its own `depends_on` — a failure that looks like a hang.
+
+### `deploy/aws/README.md`
+The runbook. Every `aws` command with what it creates, the port table, the
+request path, the durability table, cost, and teardown.
+- **Provisioning is deliberately NOT scripted; teardown is.** The risks run in
+  opposite directions: for creation you want to see each resource appear, and for
+  destruction you want one command you are not afraid of. A provisioning script
+  that creates five resources behind one line of output is the opposite of "tell
+  me what each command creates".
+- **AMI comes from Canonical's SSM parameter, not a pasted id** — ids are
+  region-specific and go stale on every image rebuild. With a documented
+  fallback that filters on Canonical's owner id, since filtering on the *name*
+  "ubuntu" would happily launch someone else's image.
+- **`HttpTokens=required`** forces IMDSv2. IMDSv1 is an unauthenticated GET,
+  which is what turns an SSRF bug into stolen instance credentials.
+- **Tradeoff:** `AmazonEC2FullAccess` is broader than needed. Scoping it by
+  resource tag is a bigger exercise than this stage, and it is stated as a
+  known compromise rather than presented as correct — with the part that
+  actually matters (never use root access keys) called out.
+
+### `deploy/aws/bootstrap.sh`
+Runs on the box as user-data: apt, swap, Docker from Docker's own repo, clone,
+seed the `.env` template. Idempotent.
+- **Contains no secrets, structurally.** User-data is readable forever from
+  inside the instance and via `describe-instance-attribute` from outside, so the
+  `.env` is written by hand over SSH afterwards. That split is the whole answer
+  to "config via environment on the box, never committed".
+- **2 GiB of swap is not optional on 1 GiB of RAM.** `npm ci` plus `vite build`
+  peaks over 1 GiB, and without swap the build is OOM-killed with exit 137 and
+  no message pointing at memory. Slow swap is fine — it absorbs a build-time
+  spike, not request traffic.
+- **Docker's apt repo, not Ubuntu's `docker.io`**, because Compose v2.24+ is
+  required (see the `!reset` note above) and Ubuntu's packaging lags. Verified in
+  a real `ubuntu:24.04` container on `linux/amd64`: the keyring and source lines
+  resolve `noble`/`amd64` correctly and `docker-compose-plugin` is 5.5.0.
+- **Tradeoff:** building on the box costs ~5–10 minutes per deploy and needs the
+  swap workaround. Pulling prebuilt images from GHCR would be faster and
+  smaller, and Stage 4's CI already builds all three — publishing them is the
+  obvious next step. Deferred to keep this stage to one moving part.
+
+### `deploy/aws/teardown.sh`
+Deletes the instance, any Elastic IP, the security group and the key pair, then
+lists what is still billable.
+- **Dry-run by default; `--yes` to apply.** A teardown script you are afraid of
+  is one you won't run, and a forgotten instance is the real cost risk here.
+- **Prints the account id first**, so it cannot quietly act on the wrong one.
+- **Ends with what is still billable** — instances, volumes, addresses,
+  snapshots — plus an all-regions sweep. Empty tables are the signal, not a `$0`
+  billing dashboard, which lags by hours.
+- **Order is dependency-driven:** the security group can't be deleted while the
+  instance holds it, and the ENI lingers seconds after termination, hence the
+  `wait` plus a retry loop.
+- **Tradeoff:** it deletes by tag/name convention, so a resource created by hand
+  outside that convention is missed. Mitigated by the still-billable listing at
+  the end, which is convention-independent.
+
+### `server/scripts/verify_deployment.py`
+The deployment acceptance test, run from a laptop against the public URL. Four
+checks: the bundle is served; `/healthz` reaches more than one instance; two
+WebSocket clients land on different instances and an edit crosses; the text
+survives both sockets closing.
+- **Uses only the public origin**, because that is all a browser has — and
+  because production closes the direct instance ports the older demo scripts
+  need.
+- **Maps `https://` → `wss://`.** Not incidental: a browser blocks a `ws://`
+  socket opened from an `https://` page as mixed content, and the symptom is
+  "loads but never connects".
+- **Timeouts are generous (10s)** because this may cross an ocean. Latency is
+  *reported*, not asserted — a slow pass is still a pass.
+- **Tradeoff:** it drives the protocol, not the UI, so it would not catch a
+  React rendering bug. Deliberate — it has to run from a laptop with no browser
+  automation. The browser check stays manual.
+
+### `.gitignore` (changed)
+`!.env.example` → `!.env*.example`.
+- Found with `git check-ignore -v` before the first commit: `.env.*` was
+  silently ignoring `deploy/aws/.env.production.example`, which `bootstrap.sh`
+  copies on the box. The file existed locally, would never have been committed,
+  and the deploy would have failed with "no such file" — a failure a long way
+  from its cause. Worth remembering that an ignored file you depend on breaks
+  somewhere else entirely.
+
+---
+
+## Verified
+
+What was actually run, all against the production overlay locally:
+
+- **`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+  --build --wait`**: all six containers healthy in **20.0 s**.
+- **Exactly one published port on the whole stack.** Enumerated from
+  `compose config --format json` rather than eyeballed: `lb` only; postgres,
+  redis, server-a, server-b and client all internal.
+- **The overlay refuses to start** with `POSTGRES_PASSWORD` unset, and
+  separately with `PUBLIC_HOST` unset. Both produce a named error.
+- **One origin serves everything**: `GET /` → 200 HTML; `/healthz` alternating
+  `b,a,b,a`; `/metrics` and `/api/doc/...` all on the same port.
+- **The baked WebSocket URL is right** — pulled the served bundle and grepped
+  it, finding `ws://localhost:8081` as derived from `PUBLIC_HOST`/`PUBLIC_PORT`.
+  Worth checking separately because `verify_deployment.py` constructs its own
+  URL and would pass even if the bundle's were wrong.
+- **`verify_deployment.py`: 4/4 checks passed**, cross-instance propagation in
+  5 ms.
+- **Two real browser tabs through the production edge**, on instances `b` and
+  `a`, syncing, no JS errors — the Stage 3 property on the Stage 5 topology.
+- **Docker's apt repo on `ubuntu:24.04`/`linux/amd64`** (the actual EC2 target):
+  keyring + source lines correct, all five packages available,
+  `docker-compose-plugin` 5.5.0.
+- **The compose-version gate** rejects 2.23.0 and 0, accepts 2.24.0 and above.
+- **`teardown.sh`** fails gracefully with a useful message when the AWS CLI is
+  absent; `bash -n` clean.
+
+**Not verified, and it matters:** every `aws` command, the AMI SSM parameter
+path, the free-tier status of any particular account, and the current prices. No
+AWS account was touched.

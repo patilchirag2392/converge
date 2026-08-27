@@ -12,6 +12,24 @@ Build plan and learning gates: [ROADMAP.md](./ROADMAP.md).
 
 ## Status
 
+**Stage 5 — deployed to AWS.** The same containerized stack on a single EC2
+instance, reachable at a public URL. One open port; Postgres and Redis stay on
+the internal Docker network.
+
+- [x] Production compose overlay: one published port, no default credentials
+- [x] Nginx edge serving the bundle *and* proxying the API on :80
+- [x] Security group locked to HTTP-from-anywhere + SSH-from-one-address
+- [x] Runbook with every command, the cost, and a scripted teardown
+- [x] `verify_deployment.py` — acceptance test against the public URL
+
+Runbook: **[deploy/aws/README.md](./deploy/aws/README.md)**. It covers the
+request path end to end, what happens to your data on stop vs terminate, the
+realistic monthly bill, and how to shut it all off.
+
+> The deployment *config* is verified locally, including two browser tabs syncing
+> across instances through the production Nginx. The AWS *resources* are
+> desk-checked, not provisioned — see the runbook's opening note.
+
 **Stage 4 — containerized, with CI.** The whole Stage 3 topology now comes up
 with one command, and every push runs both test suites plus a real stack.
 
@@ -749,6 +767,21 @@ what the pipeline runs. The load-bearing parts:
 3. **Why the pipeline sets `CONVERGE_REQUIRE_SERVICES`.** Because a suite that
    skips its integration tests goes green without testing anything.
 
+**Stage 5 — deployment.** Trace a request from browser to load balancer to
+container and back, out loud, without looking. The runbook's
+[request path](./deploy/aws/README.md#8-the-request-path-end-to-end) is the
+answer; the parts people stumble on:
+
+1. **Where does the routing decision happen, and how often?** Nginx picks an
+   upstream **per TCP connection**, not per request — which is why a tab stays
+   pinned to one instance for its whole session, and why two tabs demonstrate
+   anything at all.
+2. **Which ports are open to whom, and why is 443 closed?** Because nothing is
+   listening on it. An open port with no service is surface with no function.
+3. **What happens to the data if you terminate the instance?** It is gone. The
+   durability boundary is one EBS volume in one AZ, and `DeleteOnTermination` is
+   `true`. Be able to say what RDS would buy and why it was still skipped.
+
 **Stage 2 — persistence.** Explain the schema and why it stores what it stores, in
 that shape. The load-bearing parts: why the primary key is the operation's identity
 (idempotency for free), why an operation log rather than materialized state (for
@@ -760,10 +793,15 @@ doesn't matter, and why writes happen before broadcasts.
 ```
 NOTES.md                   per-file build notes and decisions, Stages 2-4
 docker-compose.yml         the whole topology: 2 instances + nginx + Postgres + Redis
+docker-compose.prod.yml    production overlay: one open port, no default password
 .env.example               every configurable value, with its default
+deploy/aws/README.md       the AWS runbook: every command, the cost, the teardown
+deploy/aws/bootstrap.sh    runs on the box: docker, swap, clone (no secrets)
+deploy/aws/teardown.sh     deletes everything and lists what is still billable
 .github/workflows/ci.yml   tests + image builds + a live stack, on every push
 shared/crdt-vectors.json   cases both test suites assert, pinning the two implementations
 deploy/Dockerfile          load balancer image: stock nginx + one config file
+deploy/nginx.prod.conf     public edge: serves the bundle AND proxies the API on :80
 deploy/nginx.docker.conf   load balancer config for compose (upstreams by service name)
 deploy/nginx.conf          load balancer config for host processes (upstreams on ports)
 scripts/cluster.sh         two instances + nginx (+ Redis) as host processes
@@ -780,6 +818,7 @@ server/
   scripts/race_demo.py     the Stage 0 race, now merging cleanly
   scripts/multi_instance_demo.py  does an edit cross instances? reports either answer
   scripts/latency_probe.py conversation-ready latency numbers, measured on one clock
+  scripts/verify_deployment.py  acceptance test for a deployment, public origin only
   scripts/gen_vectors.py   regenerates the shared vectors
   tests/test_crdt.py       31 tests, incl. every permutation of a concurrent edit set
   tests/test_store.py      12 tests against real Postgres, incl. the CHECK constraints

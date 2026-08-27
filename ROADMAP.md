@@ -115,9 +115,9 @@ unique ID, (c) how two clients inserting at the same position end up in the same
 ---
 
 ### Stage 5 — Deploy to cloud (NEW: AWS)
-- [ ] Deploy to AWS — start simple (EC2 + docker-compose)
+- [x] Deploy to AWS — start simple (EC2 + docker-compose) — config + runbook ready
 - [ ] (Upgrade) Move to ECS for the stronger resume line
-- [ ] Publicly reachable, shareable URL
+- [ ] Publicly reachable, shareable URL — needs the runbook run against an account
 
 **Learn-gate:** Trace a request from browser → load balancer → container → and back.
 
