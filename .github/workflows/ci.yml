@@ -1,0 +1,212 @@
+# Converge CI.
+#
+# Three jobs, deliberately parallel and independent:
+#
+#   server-tests   pytest, against real Postgres and real Redis
+#   client-tests   vitest
+#   docker         all three images build, then the whole stack runs and syncs
+#
+# They do not `needs:` each other. A type error in the client should not hide a
+# broken Dockerfile -- one push should tell you everything that is wrong, not
+# just the first thing.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch makes the older run's answer irrelevant.
+# Cancelling it saves minutes without losing information.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # The Python suite, with the databases actually present.
+  #
+  # This is the job that matters most for this stage. The suite skips its
+  # Postgres and Redis tests when those are unreachable, which is right on a
+  # laptop and dangerous here: without the service containers below, CI would
+  # report 96 passed / 7 skipped and call it green while never having touched a
+  # database. CONVERGE_REQUIRE_SERVICES=1 makes those skips hard failures, so
+  # the integration tests cannot quietly stop running.
+  # --------------------------------------------------------------------------
+  server-tests:
+    name: server tests (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: converge
+          POSTGRES_PASSWORD: converge
+          # The test database, not the dev one -- conftest TRUNCATEs it between
+          # tests, so pointing this at anything real would be destructive.
+          POSTGRES_DB: converge_test
+        ports:
+          # Published to the runner: the tests run as a host process here, not
+          # in a container, so they reach Postgres over 127.0.0.1.
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U converge -d converge_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      TEST_DATABASE_URL: postgresql://converge:converge@127.0.0.1:5432/converge_test
+      # Database 15, matching the local default -- pub/sub is not scoped by
+      # database, but it keeps any future key use out of the way.
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      CONVERGE_REQUIRE_SERVICES: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          # 3.11 everywhere: the local .venv, the Dockerfile base image, and
+          # here. uv.lock was resolved against it.
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: server/uv.lock
+
+      # --frozen: install exactly uv.lock and fail if it disagrees with
+      # pyproject.toml, so a forgotten `uv lock` fails CI instead of silently
+      # testing different versions than the image ships.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # -rs lists the reason for any skip in the log. With
+      # CONVERGE_REQUIRE_SERVICES set there should be none, so this is the
+      # receipt that the database tests really ran.
+      - name: pytest
+        run: uv run pytest -q -rs
+
+  # --------------------------------------------------------------------------
+  # The TypeScript suite. Note it asserts against shared/crdt-vectors.json,
+  # which lives outside client/ -- so the CRDT-parity check between the Python
+  # and TypeScript implementations is enforced here, not just locally.
+  # --------------------------------------------------------------------------
+  client-tests:
+    name: client tests (vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      # npm ci, not npm install: installs exactly package-lock.json and fails
+      # if the lock disagrees, rather than resolving something new in CI.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: vitest
+        run: npm test
+
+  # --------------------------------------------------------------------------
+  # Do the images build, and does the stack actually work?
+  #
+  # Building proves the Dockerfiles are valid. Running proves the compose graph
+  # is -- healthchecks, dependency ordering, service DNS, the nginx upstreams.
+  # A compose file that builds and then deadlocks on startup order is exactly
+  # the failure this stage introduces, so CI checks the running stack, not just
+  # the build.
+  # --------------------------------------------------------------------------
+  docker:
+    name: images build + stack runs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `tsc -b` runs inside the client image build, so a type error fails
+      # here too -- the image build is a real check, not just packaging.
+      - name: Build all images
+        run: docker compose build
+
+      # --wait blocks until every service with a healthcheck reports healthy,
+      # and exits non-zero if one never does. That makes this single line the
+      # test of the whole startup-ordering design: if depends_on/healthchecks
+      # are wrong, this is where it shows.
+      - name: Bring the stack up
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: The load balancer round-robins across both instances
+        shell: bash
+        run: |
+          set -euo pipefail
+          seen=$(for _ in $(seq 1 8); do
+            curl -fsS --max-time 5 http://localhost:8080/healthz | jq -r .instance
+          done | sort -u)
+          echo "instances reached through the load balancer:"
+          echo "$seen" | sed 's/^/  /'
+          count=$(echo "$seen" | wc -l | tr -d ' ')
+          if [ "$count" -lt 2 ]; then
+            echo "::error::expected to reach 2 instances, reached $count -- round-robin or a backend is broken"
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: server/uv.lock
+
+      # --no-dev: this only needs the runtime deps. websockets arrives with
+      # uvicorn[standard], which is what the demo client uses.
+      - name: Install the demo client's dependencies
+        working-directory: server
+        run: uv sync --frozen --no-dev
+
+      # The Stage 3 behaviour, asserted rather than eyeballed: two WebSocket
+      # clients routed to *different* containers, an edit typed on one, and the
+      # other must see it. The script exits 1 if it does not propagate, so this
+      # fails the build if Redis pub/sub is broken or misconfigured.
+      #
+      # It talks to the published ports (8080 for the balancer, 8001/8002 for
+      # the instances directly), so it needs nothing from inside the network.
+      # DATABASE_URL points at the *compose* Postgres on its published port, so
+      # the script's final check -- rebuilding the document from the operation
+      # log with no server involved -- runs here too rather than reporting
+      # "unreachable". Without it the runner has no Postgres at all.
+      - name: Two clients on different instances see each other's edits
+        working-directory: server
+        env:
+          DATABASE_URL: postgresql://converge:converge@localhost:55432/converge
+        run: uv run python scripts/multi_instance_demo.py
+
+      # Without this, a failure above leaves you guessing. Container logs are
+      # the only place a startup crash or a failed healthcheck is explained.
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker compose ps --all && docker compose logs --no-color --timestamps
+
+      # -v drops the Postgres volume too. The runner is thrown away anyway, but
+      # being explicit keeps the local and CI teardown identical.
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

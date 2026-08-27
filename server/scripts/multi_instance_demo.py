@@ -20,6 +20,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import websockets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -116,8 +117,20 @@ def server_state() -> dict[str, Any]:
 
 
 async def text_in_postgres() -> str:
-    """Rebuild the document from the operation log with no server involved."""
-    pool = await create_pool()
+    """Rebuild the document from the operation log with no server involved.
+
+    Reports rather than raises when the database is unreachable. Under
+    docker-compose Postgres is deliberately not published to the host, so this
+    step cannot run from outside the compose network -- but the propagation
+    result above is the actual claim of this script, and it must not be lost to
+    a failure in the corroborating detail. (CI runs exactly this way.)
+    """
+    try:
+        pool = await create_pool()
+    except (OSError, asyncpg.PostgresError) as exc:
+        # Only the connect is guarded. A failure *reading* the log is a real
+        # bug and should still blow up.
+        return f"<unreachable: {exc}; set DATABASE_URL, or run inside the compose network>"
     try:
         replica = RGA("psql")
         for op in await PostgresOpStore(pool).load_ops(DOC_ID):

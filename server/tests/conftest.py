@@ -6,6 +6,12 @@ so `uv run pytest` still works on a machine without it.
 
     createdb converge_test        # one-time setup
     TEST_DATABASE_URL=... uv run pytest    # or point it elsewhere
+
+Skipping is right on a laptop and wrong in CI. CI provisions Postgres and Redis
+as service containers specifically so the integration tests run -- if they
+skipped there, the suite would go green while never touching a database, which
+is worse than no CI. Set CONVERGE_REQUIRE_SERVICES=1 to turn every skip below
+into a failure; the workflow does exactly that.
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, NoReturn
 
 import asyncpg
 import pytest
@@ -23,6 +29,17 @@ from app.db import SCHEMA_PATH
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "postgresql:///converge_test")
 
 UNREACHABLE = (OSError, asyncpg.PostgresError, asyncpg.exceptions._base.PostgresError)
+
+REQUIRE_SERVICES = os.environ.get("CONVERGE_REQUIRE_SERVICES", "") not in ("", "0", "false")
+
+
+def _unavailable(reason: str) -> NoReturn:
+    """Skip on a dev machine, fail loudly where the service was promised."""
+    if REQUIRE_SERVICES:
+        # pytrace=False: the fixture's own traceback says nothing useful; the
+        # reason string is the whole message.
+        pytest.fail(f"{reason} (CONVERGE_REQUIRE_SERVICES is set)", pytrace=False)
+    pytest.skip(reason)
 
 
 async def _prepare(url: str) -> None:
@@ -43,7 +60,7 @@ async def pg_pool() -> AsyncIterator[asyncpg.Pool]:
         await _prepare(TEST_DATABASE_URL)
         pool = await asyncpg.create_pool(dsn=TEST_DATABASE_URL, min_size=1, max_size=5)
     except UNREACHABLE as exc:
-        pytest.skip(f"no Postgres at {TEST_DATABASE_URL}: {exc}")
+        _unavailable(f"no Postgres at {TEST_DATABASE_URL}: {exc}")
 
     assert pool is not None
     try:
@@ -63,7 +80,7 @@ def pg_url(monkeypatch: pytest.MonkeyPatch) -> str:
     try:
         asyncio.run(_prepare(TEST_DATABASE_URL))
     except UNREACHABLE as exc:
-        pytest.skip(f"no Postgres at {TEST_DATABASE_URL}: {exc}")
+        _unavailable(f"no Postgres at {TEST_DATABASE_URL}: {exc}")
 
     monkeypatch.setenv("DATABASE_URL", TEST_DATABASE_URL)
     return TEST_DATABASE_URL
@@ -86,7 +103,7 @@ async def redis_bus_factory() -> AsyncIterator[Any]:
         await probe.start()
     except Exception as exc:  # ConnectionError, OSError, ...
         await probe.close()
-        pytest.skip(f"no Redis at {REDIS_TEST_URL}: {exc}")
+        _unavailable(f"no Redis at {REDIS_TEST_URL}: {exc}")
     await probe.close()
 
     created: list[Any] = []
