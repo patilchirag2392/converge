@@ -127,8 +127,8 @@ the runbook has actually been run, or decide to tag the config as-is.
 
 **Nothing has been merged to `main` since Stage 0.** Each stage branch builds on
 the previous one, so `stage-5-aws` carries all five stages' work, well ahead of
-`origin/main`. The branch names no longer line up with what's in each. Five
-branches are on GitHub; `stage-5-aws` is local only.
+`origin/main`. The branch names no longer line up with what's in each. All six
+branches (`main` plus the five stage branches) are on GitHub.
 
 That's a deliberate consequence of the roadmap's rule ("merge when the stage's
 learn-gate passes") plus the fact that **no learn-gate has been done for Stages
@@ -247,7 +247,7 @@ as visual evidence of the progression.
    (`stage-4` is tagged). The roadmap gates merging on being able to explain the stage
    without looking. Either do the gates and merge+tag each, or decide to catch up
    in one go. The questions are in the README under *Learn-gates*.
-2. **`main` is three stages behind.** The longer this drifts, the less the history
+2. **`main` is five stages behind.** The longer this drifts, the less the history
    reads like the roadmap — which was the point of the branch-per-stage rule.
 3. **Presence is per-instance** (found at the end of Stage 3). The `clients: n`
    pill counts only sockets on the instance you're connected to, so two tabs on
