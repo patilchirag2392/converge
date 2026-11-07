@@ -5,12 +5,17 @@ URL. Deliberately the simplest thing that works: no ECS, no Fargate, no
 Kubernetes, no load balancer service, no RDS. Everything here is a resource you
 can point at and explain.
 
-**Nothing in this document has been run against a real AWS account by the
-author of the deployment config.** The stack itself is verified — the production
-overlay was built and exercised locally, including a real browser syncing across
-instances through the production Nginx (see [NOTES.md](../../NOTES.md)). The AWS
-resource commands are written from the API contracts and desk-checked, not
-executed. Where something is more likely to differ on your account, it says so.
+**This runbook has been run against a real account** (us-east-1, November
+2026): the app is live on a `t3.micro`, two browser windows sync at the public
+URL, and it survives a stop/start at a new hostname. The `t3.micro` built the
+client image without being OOM-killed. Two client bugs that only a real public
+address could expose were fixed on the way — see NOTES.md, "After the first real
+deploy". Still unverified: the scripted `verify_deployment.py` run against the
+live URL (§7), and HTTPS (§11).
+
+**If your IAM user has only `AmazonEC2FullAccess`**, the AMI lookup by SSM
+parameter in §4.3 needs `ssm:GetParameters`, which that policy does not grant.
+Use the `describe-images` fallback given there; it needs only EC2 permissions.
 
 ---
 

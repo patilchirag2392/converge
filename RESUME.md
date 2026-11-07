@@ -39,76 +39,74 @@ cd ~/Developer/converge
 git log --oneline -1               # should be the docs commit for Stage 5
 git status                         # should be clean
 cd server && uv run pytest -q      # 103 passed (96 + 7 skipped without Redis)
-cd ../client && npm test           # 43 passed
+cd ../client && npm test           # 50 passed
 ```
 
-**Where the last session stopped:** Stage 5's deployment config is written,
-locally verified and pushed, with CI green. **Nothing has been provisioned on
-AWS.** The next action is the runbook, starting with a budget alarm.
+**Where the last session stopped:** **Stage 5 is live on AWS** and the project is
+wrapped up. The EC2 box is normally **stopped** between demos (only its disk
+bills, ~$1.60/month). All stages are merged to `main` and tagged `stage-0` to
+`stage-5`.
 
 ---
 
-## The next action, concretely
+## Demoing it
 
-Stage 5's config is done. What remains is running it against a real AWS account,
-which no session has done. In order:
+**Live on AWS** — from the repo on your laptop, no SSH needed:
 
-1. **Budget alarm first.** `deploy/aws/README.md` §2. Two minutes, costs nothing,
-   and AWS has no hard spending cap — so this is the only early warning you get.
-2. **`brew install awscli`**, then make an IAM user (**not** root keys) and
-   `aws configure`. §3.
-3. **Work through §4 one command at a time.** It is deliberately unscripted so
-   each resource is visible as it appears. Five resources: key pair, security
-   group, instance + EBS volume, and optionally an Elastic IP.
-4. **Deploy on the box** (§6): fill in `.env` by hand over SSH — `PUBLIC_HOST`
-   and a generated `POSTGRES_PASSWORD`. Never in user-data.
-5. **Verify from your laptop** (§7):
-   ```bash
-   cd server && uv run python scripts/verify_deployment.py "http://$PUBLIC_HOST"
-   cd ../e2e && node prod_edge_browser.mjs "http://$PUBLIC_HOST"
-   ```
-6. **Tear down when done demoing:** `./deploy/aws/teardown.sh` then `--yes`.
+```bash
+./deploy/aws/start.sh      # ~2-3 min; waits for /healthz, prints the new URL
+./deploy/aws/stop.sh       # when done; the disk and its data stay
+```
 
-**Expect friction at exactly two places** (the parts that couldn't be verified
-without an account):
+Open the printed URL in two **new** windows (Cmd+N, type it). Never duplicate a
+tab: the client id lives in `sessionStorage`, which a duplicated tab copies.
+The hostname changes on every start; nothing needs updating for that.
 
-- The **Canonical AMI SSM parameter** path may have moved. §4.3 has a fallback
-  that filters on Canonical's owner id.
-- The **client image build on 1 GiB of RAM**. If you see `exit code: 137`, that
-  is the kernel's OOM killer, not npm. §6 covers it; `bootstrap.sh` already adds
-  2 GiB of swap to try to prevent it.
+SSH is only needed to change something on the box, and only works from the IP
+in the security group — see the runbook §10 if it times out.
+
+**Locally, the before/after story** (Stage 0 clobbering, then the fix across two
+instances): the "Getting running again" section below. Never run the Stage 0
+dev server and the compose stack together — both want port 5173.
+
+**Gone for good?** `./deploy/aws/teardown.sh --yes` gets the bill to $0 but
+deletes the data, and rebuilding is the full runbook again (~20-30 min).
 
 ---
 
 ## Where things stand
 
-**Stages 0–4 are built, verified and green in CI. Stage 5's deployment config
-is written and locally verified; nothing has been provisioned on AWS.**
+**All five stages are built, green in CI, merged to `main` and tagged. Stage 5
+is live on AWS.**
 
 | Stage | What | State |
 |---|---|---|
 | 0 | last-write-wins, edits clobber | done, tagged `stage-0` |
-| 1 | hand-written RGA CRDT | done, **not tagged, not merged** |
-| 2 | Postgres persistence (op log) | done, **not tagged, not merged** |
-| 3 | Redis pub/sub across 2 instances | done and pushed, **not tagged, not merged** |
-| 4 | Docker + GitHub Actions | done, pushed, **CI green**, tagged `stage-4` |
-| 5 | Deploy to AWS | config + runbook done; **nothing provisioned yet** |
+| 1 | hand-written RGA CRDT | done, tagged `stage-1` |
+| 2 | Postgres persistence (op log) | done, tagged `stage-2` |
+| 3 | Redis pub/sub across 2 instances | done, tagged `stage-3` |
+| 4 | Docker + GitHub Actions | done, **CI green**, tagged `stage-4` |
+| 5 | Deploy to AWS | **live on EC2**, tagged `stage-5` |
 
-Tests: **103 server** (`cd server && uv run pytest`), **43 client**
+Tests: **103 server** (`cd server && uv run pytest`), **50 client**
 (`cd client && npm test`). Every commit on `stage-3-redis` passes independently —
 verified in a throwaway worktree, not assumed.
 
 ### Git topology — read this before doing anything
 
 ```
-main              e801044   Stage 0 only (+ one demo fix)      [pushed]
-stage-1-crdt      f433c0a   Stage 1                            [pushed]
-stage-2-postgres  f0a0955   Stage 1 + 2                        [pushed]
-stage-3-redis     cf6a626   Stage 1 + 2 + 3                    [pushed]
-stage-4-docker-ci bbbbfc6   Stage 1 + 2 + 3 + 4                [pushed, CI green]
-stage-5-aws       (tip)     Stage 1 + 2 + 3 + 4 + 5 ← current  [pushed, CI green]
-tags              stage-0, stage-4                             [pushed]
+main              (tip)     everything, Stages 0-5             [pushed]
+stage-5-aws       (tip)     same commit as main                [pushed]
+stage-1-crdt      f433c0a   Stage 1                            [pushed, = tag stage-1]
+stage-2-postgres  f0a0955   Stage 1 + 2                        [pushed, = tag stage-2]
+stage-3-redis     cf6a626   Stage 1 + 2 + 3                    [pushed, = tag stage-3]
+stage-4-docker-ci bbbbfc6   Stage 1 + 2 + 3 + 4                [pushed, = tag stage-4]
+tags              stage-0 … stage-5                            [pushed]
 ```
+
+Each stage branch builds on the previous one, so `main` was fast-forwarded —
+no merge commits, history unchanged. The tags are the way to jump to any stage
+(`git checkout stage-0` for the "before" demo).
 
 **CI is green on `stage-4-docker-ci`** (run 33083297367): 103 server tests with
 **zero skips**, 43 client tests, all three images built, the stack came up and an
@@ -120,19 +118,13 @@ major aliases only up to v7; it is pinned to `v10.0.1` now.
 server tests with zero skips, 43 client, all three images built, stack up, edit
 crossed instances in 9.8 ms. So `bootstrap.sh` can clone it and the deploy is
 unblocked.
+Latest green run, after the deploy fixes: 42329559401 (103 server, 50 client,
+stack up).
 
-**`stage-5` is deliberately NOT tagged.** Tagging a stage whose deliverable is
-"live at a public URL" felt premature while nothing is provisioned. Tag it once
-the runbook has actually been run, or decide to tag the config as-is.
-
-**Nothing has been merged to `main` since Stage 0.** Each stage branch builds on
-the previous one, so `stage-5-aws` carries all five stages' work, well ahead of
-`origin/main`. The branch names no longer line up with what's in each. All six
-branches (`main` plus the five stage branches) are on GitHub.
-
-That's a deliberate consequence of the roadmap's rule ("merge when the stage's
-learn-gate passes") plus the fact that **no learn-gate has been done for Stages
-1–5**. Decide whether to keep gating or catch up — see loose ends below.
+**Merged and tagged without the learn-gates.** The roadmap gates each merge on
+explaining the stage without looking. That was not done here; the decision was
+to catch up in one go and do the understanding separately — by rebuilding the
+project from scratch in a new repo, which is the learn-gate done properly.
 
 ---
 
@@ -167,7 +159,7 @@ the API.
 
 ```bash
 cd ~/Developer/converge
-export PUBLIC_HOST=localhost PUBLIC_PORT=8081 POSTGRES_PASSWORD=whatever-you-like
+export PUBLIC_PORT=8081 POSTGRES_PASSWORD=whatever-you-like
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --wait
 
 # everything on ONE port: the app, the API, the socket
@@ -243,27 +235,25 @@ as visual evidence of the progression.
 
 ## Loose ends, roughly in priority order
 
-1. **No learn-gate done for Stages 1, 2, 3 or 5**, and no `stage-1`/`stage-2`/`stage-3`/`stage-5` tags
-   (`stage-4` is tagged). The roadmap gates merging on being able to explain the stage
-   without looking. Either do the gates and merge+tag each, or decide to catch up
-   in one go. The questions are in the README under *Learn-gates*.
-2. **`main` is five stages behind.** The longer this drifts, the less the history
-   reads like the roadmap — which was the point of the branch-per-stage rule.
+1. **No learn-gate done for Stages 1–5.** Merged and tagged anyway (see Git
+   topology). The questions are in the README under *Learn-gates*.
+2. **`verify_deployment.py` has not been run against the live URL.** The
+   deployment was confirmed by hand — two browser windows syncing at the
+   public address, and again after a stop/start at the new hostname — but the
+   scripted four-check acceptance test only ran against the local prod
+   overlay. With the box started: `cd server && uv run python
+   scripts/verify_deployment.py "http://<hostname from start.sh>"`.
 3. **Presence is per-instance** (found at the end of Stage 3). The `clients: n`
    pill counts only sockets on the instance you're connected to, so two tabs on
    different instances each show `clients: 1`. Visibly wrong. Needs presence in
    Redis with its own expiry/liveness design.
-4. **Stage 5 has never touched AWS.** The deployment config is verified locally
-   (prod overlay, one open port, browser tabs syncing through the production
-   nginx) but every `aws` command in `deploy/aws/README.md` is desk-checked, not
-   run. Unknowns that only a real account resolves: whether the Canonical AMI
-   SSM parameter path still works, whether the free tier applies to this
-   account, and whether a `t3.micro` really survives the client image build with
-   2 GiB of swap. Do a budget alarm first, then work through the runbook.
-5. **`stage-5` is untagged**, unlike `stage-4`. Decide whether to tag the config
-   now or only once it has been deployed. If you tag it, prefer
-   `REPO_REF=stage-5` over a branch name in `bootstrap.sh` — a tag is
-   reproducible, a moving branch isn't.
+4. **Duplicated tabs share a client id.** `sessionStorage` is copied into a
+   duplicated tab, so both windows become the same CRDT replica and can mint
+   colliding character ids. Demos avoid it by opening fresh windows; the fix is
+   an id per page load (in memory, not `sessionStorage`).
+5. **No HTTPS.** Needs a domain (Let's Encrypt won't issue for
+   `*.amazonaws.com`) and a certificate on the edge nginx; runbook §11. The
+   client already picks `wss://` on an https page.
 6. **A Redis restart reports a false error** (found during Stage 4, filed not
    fixed). The first edit after Redis is replaced gets
    `"could not persist operations"` — which is untrue: the ops *are* in Postgres
@@ -535,3 +525,34 @@ provisioned.**
 - **Not verified**: every `aws` command, the AMI SSM path, free-tier status,
   current prices. Said so in the runbook's opening paragraph rather than implying
   otherwise.
+
+---
+
+## Session log — the first real deploy (2026-11)
+
+The runbook was run against a real account for the first time. What it found:
+
+- **A stale `~/.ssh/converge-key.pem`** from an earlier attempt made the
+  key-pair redirect fail with zsh `permission denied` (mode 400). The `aws` call
+  never ran, so nothing was half-created.
+- **SSH timed out** because the source IP no longer matched the port-22 rule.
+  Fixed by replacing the rule; the runbook §10 has the commands.
+- **Blank page** — `crypto.randomUUID is not a function`. It only exists in a
+  secure context; the EC2 page is plain HTTP. Every earlier check ran on
+  localhost. Fixed with `crypto.getRandomValues`.
+- **Restarts were a chore**: each stop/start gave a new hostname, baked into the
+  bundle, so SSH + `.env` edit + rebuild. Fixed by building production with
+  `VITE_WS_URL=same-origin`; added `start.sh`/`stop.sh`.
+- **The `t3.micro` survived the client build** with the 2 GiB of swap
+  `bootstrap.sh` adds — one of the two "expect friction" unknowns, resolved.
+- **CI flaked once** on the stack job: Docker could not bind 55432 on the
+  runner (`address already in use`). A re-run passed. 55432/56379 sit inside
+  Linux's ephemeral port range, so it can recur; moving them below 32768 would
+  end it.
+- **Locally**, the demo hit the `InvalidPasswordError` trap again (an old
+  `pgdata` volume from a prod-overlay run) — `down -v` fixed it.
+
+Then: `main` fast-forwarded to the tip, tags `stage-1`, `stage-2`, `stage-3` and
+`stage-5` added. The project is wrapped up here; the learning continues in a
+from-scratch rebuild.
+

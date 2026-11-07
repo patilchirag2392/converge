@@ -21,14 +21,20 @@ the internal Docker network.
 - [x] Security group locked to HTTP-from-anywhere + SSH-from-one-address
 - [x] Runbook with every command, the cost, and a scripted teardown
 - [x] `verify_deployment.py` — acceptance test against the public URL
+- [x] **Live:** deployed to a `t3.micro` in us-east-1; two browser windows sync
+  at the public URL
+- [x] `deploy/aws/stop.sh` / `start.sh` — pause between demos, resume in one
+  command (the client follows whatever hostname served it, so no rebuild)
 
 Runbook: **[deploy/aws/README.md](./deploy/aws/README.md)**. It covers the
 request path end to end, what happens to your data on stop vs terminate, the
 realistic monthly bill, and how to shut it all off.
 
-> The deployment *config* is verified locally, including two browser tabs syncing
-> across instances through the production Nginx. The AWS *resources* are
-> desk-checked, not provisioned — see the runbook's opening note.
+> The runbook has now been run against a real account. Two bugs only a real
+> public address could expose were found and fixed on the way: a blank page
+> (`crypto.randomUUID` does not exist on a plain-HTTP origin) and a socket URL
+> baked in at build time (every stop/start changes the EC2 hostname). Both are
+> in NOTES.md. `verify_deployment.py` has not yet been run against the live URL.
 
 **Stage 4 — containerized, with CI.** The whole Stage 3 topology now comes up
 with one command, and every push runs both test suites plus a real stack.
@@ -105,7 +111,7 @@ Open <http://localhost:5173/?doc=demo>, then the same URL in a second tab.
 
 ```bash
 cd server && uv run pytest                       # 81 tests; database ones skip if no PG
-cd client && npm test                            # 43 tests
+cd client && npm test                            # 50 tests
 cd server && uv run python scripts/race_demo.py  # the Stage 0 race, now merging
 curl localhost:8000/api/doc/demo                 # the server's replica, rendered
 psql converge -c 'SELECT * FROM operations LIMIT 5'
