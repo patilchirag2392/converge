@@ -271,13 +271,14 @@ as visual evidence of the progression.
    defects: no publish retry on the bus, and one exception handler covering two
    failure modes with opposite consequences. Deterministic repro and full
    diagnosis in NOTES.md. Doesn't affect a clean-state `compose up`.
-7. **`VITE_WS_URL` is still baked into the client image at build time.** Stage 5
-   works around it rather than fixing it: the image is built *on the box* from
-   the box's `.env`, so one variable (`PUBLIC_HOST`) drives it. The cost is real
-   though — a stop/start changes the EC2 hostname, and recovering means editing
-   `.env` and **rebuilding**, not restarting. An Elastic IP avoids it. The
-   actual fix is runtime injection: an entrypoint writing a `config.js` the app
-   reads.
+7. ~~`VITE_WS_URL` baked into the client image~~ **Fixed after the first real
+   deploy.** Production now builds with `VITE_WS_URL=same-origin`, and the
+   client derives the socket URL from the page's own address (`wss://` on
+   https). A stop/start's new hostname needs no `.env` edit and no rebuild;
+   `deploy/aws/stop.sh` / `start.sh` pause and resume the box from the laptop.
+   Simpler than the `config.js` entrypoint once planned, because nginx already
+   serves page and socket on one origin. Dev and the base compose stack still
+   take an explicit URL, since there the socket is on a different port.
 8. **`scripts/cluster.sh` survives on purpose.** compose replaced it for
    everything except running the stack as bare host processes, which is still
    the fastest loop for code changes. It's still a shell script with no

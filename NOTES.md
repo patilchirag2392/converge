@@ -1199,3 +1199,36 @@ What was actually run, all against the production overlay locally:
 **Not verified, and it matters:** every `aws` command, the AMI SSM parameter
 path, the free-tier status of any particular account, and the current prices. No
 AWS account was touched.
+
+---
+
+## After the first real deploy (November)
+
+Two client fixes, both found only once the app ran at a real public address,
+and both invisible on `localhost`:
+
+- **Blank page: `crypto.randomUUID is not a function`.** Browsers expose it only
+  in a secure context (HTTPS or localhost); the EC2 page is plain HTTP on a
+  public hostname. Client ids now come from `crypto.getRandomValues`. Every
+  earlier check ran on localhost, which counts as secure.
+- **The socket URL is resolved at run time, not baked in.** Production builds
+  with `VITE_WS_URL=same-origin` (`resolveWsBase` in `useDocSocket.ts`): the
+  client connects to the host that served the page. Because nginx already
+  serves bundle and socket on one origin, this needs no entrypoint or
+  `config.js`. Consequences: `PUBLIC_HOST` is gone from `.env`; a stop/start's
+  new hostname needs no edit and no rebuild; HTTPS gets `wss://` for free.
+  The tradeoff: the base compose stack and the dev server still need an
+  explicit URL, because there the page (5173) and the socket (8080/8000) are on
+  different ports — so the variable stays, with a third meaning.
+- **`deploy/aws/start.sh` / `stop.sh`** pause and resume the box from the
+  laptop. `start.sh` polls the public `/healthz` rather than trusting
+  "instance running", since boot → Docker → six healthchecks takes a while.
+  Exercised against a stubbed `aws`/`curl` (stopped, running, missing
+  instance); not yet against a real account.
+
+Verified: a production build with `same-origin`, served on a non-loopback HTTP
+address in headless Chromium, renders and opens
+`ws://<that address>/ws/demo`; the same build on localhost opens
+`ws://localhost:<port>/ws/demo`. `compose config` for the prod overlay resolves
+`VITE_WS_URL=same-origin` with `PUBLIC_HOST` unset, still publishes exactly one
+port, and still refuses to start without `POSTGRES_PASSWORD`.

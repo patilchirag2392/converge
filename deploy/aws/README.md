@@ -326,9 +326,11 @@ echo "public host: $PUBLIC_HOST"
 
 ### 4.4 Optional — an Elastic IP, for a URL that survives a stop/start
 
-Skip this unless you need it. Without it, stopping and starting the instance
-changes its public DNS name, which means editing `.env` and **rebuilding the
-client image** (the hostname is baked into the bundle).
+Skip this unless you need it. Stopping and starting the instance changes its
+public DNS name, but the app no longer cares: the client connects back to
+whatever host served the page, so it works at the new address with no edit or
+rebuild. An Elastic IP only buys a URL that stays the same, at ~$3.65/month
+while the instance is stopped.
 
 ```bash
 export ALLOC_ID=$(aws ec2 allocate-address --region "$AWS_REGION" --domain vpc \
@@ -405,24 +407,15 @@ docker compose version                            # must be >= 2.24
 free -h                                           # swap should show 2.0Gi
 ```
 
-Then fill in the environment file. **These values only ever exist on this box.**
+Then fill in the environment file. **Its values only ever exist on this box.**
+There is one: the database password. (There is no hostname to set — the client
+connects back to whatever host served the page.)
 
 ```bash
 cd /opt/converge
-
-# The hostname browsers will use, read from instance metadata (IMDSv2).
-TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
-  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
-curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-  http://169.254.169.254/latest/meta-data/public-hostname; echo
-
 openssl rand -base64 24        # the database password — generate, don't invent
-
-nano .env                      # set PUBLIC_HOST and POSTGRES_PASSWORD
+nano .env                      # set POSTGRES_PASSWORD
 ```
-
-> If you attached an Elastic IP or have a domain, `PUBLIC_HOST` is that, not the
-> metadata hostname.
 
 Bring it up:
 
@@ -542,8 +535,9 @@ Tracing `http://ec2-1-2-3-4.compute-1.amazonaws.com/?doc=demo`.
 
 ### Opening the socket
 
-9. The bundle runs. `VITE_WS_URL` was inlined at build time as
-   `ws://$PUBLIC_HOST:80`, so it opens
+9. The bundle runs. `VITE_WS_URL` was inlined at build time as `same-origin`,
+   so the client builds the socket URL from the page's own address
+   (`ws://` because the page is `http://`), and opens
    `ws://ec2-1-2-3-4.compute-1.amazonaws.com/ws/demo?client_id=a1b2c3d4`.
 10. Same route to Nginx (steps 1–4). Now `location /ws/` matches, which is the
     block that carries `proxy_http_version 1.1` and the `Upgrade` /
@@ -620,8 +614,8 @@ Two consequences worth internalising:
   default, which section 4.3 sets explicitly so it isn't a surprise — means
   terminating deletes the disk with the instance.
 - **Stopping changes the public DNS name** (unless you attached an Elastic IP).
-  The data is fine, but the client bundle has the old hostname baked in, so
-  after a start you must update `.env` and rebuild.
+  Nothing needs updating: the containers restart with the instance, and the
+  client connects to whatever address the page was loaded from.
 
 ### Back it up before you tear down
 
@@ -698,18 +692,17 @@ cd /opt/converge && git pull
 dc up -d --build --wait
 ```
 
-**After a stop/start** (the hostname changed):
+**Pausing between demos** — from your laptop, not the box:
 
 ```bash
-# new hostname
-TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
-  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
-curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-  http://169.254.169.254/latest/meta-data/public-hostname; echo
-
-nano .env                      # update PUBLIC_HOST
-dc up -d --build               # --build is REQUIRED: the URL is baked into the bundle
+./deploy/aws/stop.sh           # stops the instance; the disk (and data) stays
+./deploy/aws/start.sh          # starts it, waits for /healthz, prints the new URL
 ```
+
+No SSH and no rebuild after a start. Every container has
+`restart: unless-stopped` and Docker starts at boot, so the stack comes back on
+its own; the new public hostname needs no configuration because the client
+connects to whatever host served the page.
 
 **SSH broke because your IP changed:**
 
@@ -760,11 +753,12 @@ aws ec2 authorize-security-group-ingress --region "$AWS_REGION" --group-id "$SG_
 
 2. Nginx needs a `listen 443 ssl` server block with the certificate, and
    `nginx.prod.conf` is where it goes.
-3. **`PUBLIC_HOST` must produce `wss://`, not `ws://`** — browsers block a
-   `ws://` socket opened from an `https://` page as mixed content, and the
-   failure looks like "the page loads but never connects". The bundle takes the
-   scheme from `VITE_WS_URL`, so this is a rebuild, and
-   `verify_deployment.py` already maps an `https://` base URL to `wss://`.
+3. **The socket must be `wss://`, not `ws://`** — browsers block a `ws://`
+   socket opened from an `https://` page as mixed content, and the failure looks
+   like "the page loads but never connects". Already handled: with
+   `VITE_WS_URL=same-origin` the client picks `wss://` whenever the page is
+   `https://`, and `verify_deployment.py` maps an `https://` base URL to
+   `wss://`.
 
 ---
 
@@ -811,8 +805,9 @@ termination — hence the `wait`, and the retry loop in the script.
 ### Just pausing?
 
 ```bash
-aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID"
+./deploy/aws/stop.sh           # and ./deploy/aws/start.sh to bring it back
 ```
 
 Instance-hours stop. The EBS volume keeps billing (~$1.60/month) and your data
-is safe. The public DNS name changes on the next start — see section 10.
+is safe. The public DNS name changes on the next start, which needs nothing
+from you — `start.sh` prints the new URL. See section 10.
