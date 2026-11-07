@@ -11,7 +11,32 @@ import { RGA, idKey, type Id, type Operation } from './crdt';
 import { diffText } from './diff';
 import type { ClientMessage, ServerMessage, Status } from './protocol';
 
-const WS_BASE = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
+/**
+ * Where the WebSocket lives, from the build-time VITE_WS_URL:
+ *
+ *   unset          ws://localhost:8000 -- the dev server on its default port
+ *   "same-origin"  the host that served this page, ws:// or wss:// to match
+ *   anything else  used as given (e.g. ws://localhost:8080 under compose)
+ *
+ * "same-origin" is what production uses: nginx serves the bundle and proxies
+ * /ws/ on one public origin, so the page already knows where the socket is.
+ * Baking a hostname in instead meant every EC2 stop/start -- which changes the
+ * public DNS name -- needed an .env edit and a client REBUILD, or the page
+ * loaded but never connected. Deriving it at run time makes the same image
+ * work at any address, and picks wss:// automatically once HTTPS is added.
+ */
+export function resolveWsBase(
+  configured: string | undefined,
+  location: Pick<Location, 'protocol' | 'host'>,
+): string {
+  if (configured === undefined || configured === '') return 'ws://localhost:8000';
+  if (configured === 'same-origin') {
+    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${scheme}//${location.host}`;
+  }
+  return configured;
+}
+
 const RECONNECT_DELAY_MS = 1000;
 const MAX_EVENTS = 8;
 
@@ -194,7 +219,7 @@ export function useDocSocket(docId: string): DocSocket {
 
     const connect = () => {
       setStatus('connecting');
-      socket = new WebSocket(`${WS_BASE}/ws/${encodeURIComponent(docId)}?client_id=${clientId}`);
+      socket = new WebSocket(`${resolveWsBase(import.meta.env.VITE_WS_URL, window.location)}/ws/${encodeURIComponent(docId)}?client_id=${clientId}`);
       socketRef.current = socket;
 
       socket.onopen = () => {

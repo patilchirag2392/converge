@@ -136,14 +136,8 @@ secrets that are deliberately not in this script.
 Next, as $LOGIN_USER:
 
   cd $APP_DIR
-  # PUBLIC_HOST is what you type in a browser; get it from the instance metadata:
-  TOKEN=\$(curl -sX PUT http://169.254.169.254/latest/api/token \\
-    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
-  curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" \\
-    http://169.254.169.254/latest/meta-data/public-hostname; echo
-
   openssl rand -base64 24        # the POSTGRES_PASSWORD
-  nano .env                      # fill in PUBLIC_HOST and POSTGRES_PASSWORD
+  nano .env                      # paste it as POSTGRES_PASSWORD=
 
   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 

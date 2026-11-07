@@ -71,16 +71,16 @@ services:
     build:
       context: ./client
       args:
-        # Derived from ONE variable, so the box's .env sets the public hostname
-        # once and this follows. Getting it wrong is the most likely way to
-        # deploy a page that loads but never connects, so it should not be
-        # hand-written twice.
+        # "same-origin": the client connects to whatever host served the page
+        # (ws:// on http, wss:// on https). nginx serves the bundle and proxies
+        # /ws/ on that one origin, so the browser already knows the address.
         #
-        # Same origin and same port as the page itself, because nginx serves
-        # both. `ws://` (not `wss://`) because TLS is not configured by default
-        # -- see the runbook. If TLS is added this MUST become wss://, since
-        # browsers block ws:// from an https:// page as mixed content.
-        VITE_WS_URL: ws://${PUBLIC_HOST:?PUBLIC_HOST must be set in .env on the box}:${PUBLIC_PORT:-80}
+        # This used to be ws://${PUBLIC_HOST}:${PUBLIC_PORT}, baked in at build
+        # time. Every EC2 stop/start changes the public DNS name, so each
+        # restart needed an .env edit and a client rebuild over SSH, or the page
+        # loaded and never connected. Now the image is the same at any address,
+        # and a stopped instance comes back working with no intervention.
+        VITE_WS_URL: same-origin
 
   lb:
     build:
