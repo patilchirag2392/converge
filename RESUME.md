@@ -454,6 +454,12 @@ independently by `/metrics` (0.27–0.39 ms for the publish→remote-handling le
   publishes moving tags only up to `v7`, so `@v10` does not resolve even though
   `v10.0.1` is current. Checking the latest *release* is not the same as checking
   the alias exists. Pin exact releases in CI.
+- **`crypto.randomUUID()` does not exist on a plain-HTTP public origin.** Browsers
+  only expose it in a secure context (HTTPS or `localhost`). Every local check ran
+  on `localhost`, so the first real EC2 deploy rendered a blank page
+  (`crypto.randomUUID is not a function`). Client ids now come from
+  `crypto.getRandomValues`. Anything browser-side has to be checked on a
+  non-localhost HTTP origin before it ships here.
 
 ---
 

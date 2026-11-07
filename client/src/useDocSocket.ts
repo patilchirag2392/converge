@@ -41,13 +41,24 @@ export interface DocSocket {
   onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void;
 }
 
+/** 8 random hex characters.
+ *
+ *  Not `crypto.randomUUID()`: browsers only expose that in a secure context
+ *  (HTTPS or localhost). The deployed app is served over plain HTTP from a
+ *  public hostname, where it is undefined -- calling it threw during the first
+ *  render and left a blank page. `getRandomValues` has no such restriction. */
+export function randomClientId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 /** A stable id for this browser tab. sessionStorage is per-tab, so two tabs on
  *  the same URL are genuinely different replicas. */
 function useClientId(): string {
   const [clientId] = useState(() => {
     const existing = sessionStorage.getItem('converge:client_id');
     if (existing) return existing;
-    const fresh = crypto.randomUUID().slice(0, 8);
+    const fresh = randomClientId();
     sessionStorage.setItem('converge:client_id', fresh);
     return fresh;
   });
